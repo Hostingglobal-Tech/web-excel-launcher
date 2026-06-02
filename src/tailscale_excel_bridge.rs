@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::os::unix::fs::OpenOptionsExt;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -256,6 +257,12 @@ end"#,
             log.push('\n');
         }
         execute_computer_action_lines(&action_lines)?;
+        thread::sleep(std::time::Duration::from_millis(1000));
+
+        if excel_process_seen() {
+            log.push_str("verify=EXCEL.EXE 감지됨, computer loop 종료\n");
+            return Ok(log);
+        }
 
         let screenshot_b64 = capture_windows_screenshot_base64()?;
         let response_id = jq_first_string(&body, ".id")?
@@ -296,36 +303,23 @@ fn call_openai_computer_screenshot(
 
 fn call_openai_json(api_key: &str, payload: &str) -> Result<String, String> {
     let auth = format!("Authorization: Bearer {api_key}");
-    let mut child = Command::new("curl")
-        .args([
-            "-sS",
-            "--max-time",
-            "35",
-            "https://api.openai.com/v1/responses",
-            "-H",
-            &auth,
-            "-H",
-            "Content-Type: application/json",
-            "--data-binary",
-            "@-",
-            "-w",
-            "\n__HTTP_STATUS__:%{http_code}",
-        ])
-        .stdin(Stdio::piped())
+    let payload_path = write_secret_temp("openai-payload", ".json", payload)?;
+    let data_ref = format!("@{}", payload_path.display());
+    let config = format!(
+        "silent\nshow-error\nmax-time = \"35\"\nurl = \"https://api.openai.com/v1/responses\"\nheader = {}\nheader = \"Content-Type: application/json\"\ndata-binary = {}\nwrite-out = \"\\n__HTTP_STATUS__:%{{http_code}}\"\n",
+        curl_config_string(&auth),
+        curl_config_string(&data_ref)
+    );
+    let config_path = write_secret_temp("openai-curl", ".conf", &config)?;
+    let output = Command::new("curl")
+        .args(["--config", config_path.to_string_lossy().as_ref()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("curl 실행 실패: {err}"))?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(payload.as_bytes())
-            .map_err(|err| format!("curl stdin 쓰기 실패: {err}"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("curl 대기 실패: {err}"))?;
+        .output()
+        .map_err(|err| format!("curl 실행 실패: {err}"));
+    let _ = fs::remove_file(&config_path);
+    let _ = fs::remove_file(&payload_path);
+    let output = output?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -577,21 +571,25 @@ fn forward_to_agent_endpoint(agent_url: &str, endpoint: &str, prompt: &str) -> R
     let token = bridge_token();
     let run_url = format!("{}/{}", agent_url.trim_end_matches('/'), endpoint);
     let header = format!("X-Excel-Bridge-Token: {token}");
-    let form = format!("prompt={prompt}");
+    let form = format!("prompt={}", url_encode(prompt));
     let timeout = if endpoint == "run-computer" { "100" } else { "30" };
+    let form_path = write_secret_temp("excel-agent-form", ".txt", &form)?;
+    let data_ref = format!("@{}", form_path.display());
+    let config = format!(
+        "silent\nshow-error\nmax-time = {}\nurl = {}\nheader = {}\nheader = \"Content-Type: application/x-www-form-urlencoded\"\ndata-binary = {}\n",
+        curl_config_string(timeout),
+        curl_config_string(&run_url),
+        curl_config_string(&header),
+        curl_config_string(&data_ref)
+    );
+    let config_path = write_secret_temp("excel-agent-curl", ".conf", &config)?;
     let output = Command::new("curl")
-        .args([
-            "-sS",
-            "--max-time",
-            timeout,
-            "-H",
-            &header,
-            "--data-urlencode",
-            &form,
-            &run_url,
-        ])
+        .args(["--config", config_path.to_string_lossy().as_ref()])
         .output()
-        .map_err(|err| format!("curl 실행 실패: {err}"))?;
+        .map_err(|err| format!("curl 실행 실패: {err}"));
+    let _ = fs::remove_file(&config_path);
+    let _ = fs::remove_file(&form_path);
+    let output = output?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -642,36 +640,23 @@ fn classify_prompt_with_openai(prompt: &str) -> Result<PromptAction, String> {
 
 fn call_openai_responses_api(api_key: &str, payload: &str) -> Result<String, String> {
     let auth = format!("Authorization: Bearer {api_key}");
-    let mut child = Command::new("curl")
-        .args([
-            "-sS",
-            "--max-time",
-            "25",
-            "https://api.openai.com/v1/responses",
-            "-H",
-            &auth,
-            "-H",
-            "Content-Type: application/json",
-            "--data-binary",
-            "@-",
-            "-w",
-            "\n__HTTP_STATUS__:%{http_code}",
-        ])
-        .stdin(Stdio::piped())
+    let payload_path = write_secret_temp("openai-payload", ".json", payload)?;
+    let data_ref = format!("@{}", payload_path.display());
+    let config = format!(
+        "silent\nshow-error\nmax-time = \"25\"\nurl = \"https://api.openai.com/v1/responses\"\nheader = {}\nheader = \"Content-Type: application/json\"\ndata-binary = {}\nwrite-out = \"\\n__HTTP_STATUS__:%{{http_code}}\"\n",
+        curl_config_string(&auth),
+        curl_config_string(&data_ref)
+    );
+    let config_path = write_secret_temp("openai-curl", ".conf", &config)?;
+    let output = Command::new("curl")
+        .args(["--config", config_path.to_string_lossy().as_ref()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("curl 실행 실패: {err}"))?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(payload.as_bytes())
-            .map_err(|err| format!("curl stdin 쓰기 실패: {err}"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("curl 대기 실패: {err}"))?;
+        .output()
+        .map_err(|err| format!("curl 실행 실패: {err}"));
+    let _ = fs::remove_file(&config_path);
+    let _ = fs::remove_file(&payload_path);
+    let output = output?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -1071,6 +1056,58 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+fn url_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            b' ' => out.push('+'),
+            byte => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn curl_config_string(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    format!("\"{escaped}\"")
+}
+
+fn write_secret_temp(prefix: &str, suffix: &str, content: &str) -> Result<PathBuf, String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+
+    for attempt in 0..20 {
+        let path = env::temp_dir().join(format!(
+            "{prefix}-{}-{stamp}-{attempt}{suffix}",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(content.as_bytes())
+                    .map_err(|err| format!("임시 파일 쓰기 실패 {path:?}: {err}"))?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("임시 파일 생성 실패 {path:?}: {err}")),
+        }
+    }
+
+    Err("임시 파일 이름을 만들지 못했습니다.".to_string())
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
