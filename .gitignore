@@ -1,0 +1,6 @@
+.env
+.env.*
+*.log
+target/
+web-excel-launcher
+web-excel-launcher.exe
