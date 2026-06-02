@@ -202,6 +202,30 @@ Gateway endpoints:
 - `POST /prompt`
 - `POST /prompt-computer`
 
+## Systemd User Services
+
+`deploy/`에는 재부팅 후에도 agent/gateway가 다시 올라오도록 하는 user systemd 템플릿이 들어 있습니다.
+
+Local agent:
+
+```bash
+install -D -m 644 deploy/tailscale-excel-agent.service ~/.config/systemd/user/tailscale-excel-agent.service
+install -D -m 600 deploy/tailscale-excel-agent.env.example ~/.config/tailscale-excel-agent.env
+systemctl --user daemon-reload
+systemctl --user enable --now tailscale-excel-agent.service
+```
+
+Gateway:
+
+```bash
+install -D -m 644 deploy/tailscale-excel-gateway.service ~/.config/systemd/user/tailscale-excel-gateway.service
+install -D -m 600 deploy/tailscale-excel-gateway.env.example ~/.config/tailscale-excel-gateway.env
+systemctl --user daemon-reload
+systemctl --user enable --now tailscale-excel-gateway.service
+```
+
+실제 운영 전에는 env 파일의 placeholder를 개인 Tailnet IP, bridge token, API key 값으로 바꾸십시오.
+
 ## Verification Examples
 
 Prompt classification mode:

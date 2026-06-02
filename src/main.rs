@@ -554,7 +554,7 @@ fn powershell_single_quote(value: &str) -> String {
 }
 
 fn spawn_powershell(command: &str) -> Result<(), String> {
-    Command::new("powershell.exe")
+    Command::new(powershell_path())
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -562,6 +562,20 @@ fn spawn_powershell(command: &str) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|err| format!("powershell.exe 실행 실패: {err}"))
+}
+
+fn powershell_path() -> &'static str {
+    const CANDIDATES: [&str; 3] = [
+        "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+        "/mnt/c/Windows/System32/powershell.exe",
+        "powershell.exe",
+    ];
+    for candidate in CANDIDATES {
+        if candidate.contains('/') && Path::new(candidate).exists() {
+            return candidate;
+        }
+    }
+    "powershell.exe"
 }
 
 fn form_value(body: &[u8], name: &str) -> Option<String> {

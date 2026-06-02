@@ -527,7 +527,7 @@ fn click_mouse(x: i32, y: i32, double_click: bool) -> Result<(), String> {
 }
 
 fn excel_process_seen() -> bool {
-    Command::new("powershell.exe")
+    Command::new(powershell_path())
         .args([
             "-NoProfile",
             "-Command",
@@ -539,7 +539,7 @@ fn excel_process_seen() -> bool {
 }
 
 fn run_powershell_wait(command: &str) -> Result<(), String> {
-    let output = Command::new("powershell.exe")
+    let output = Command::new(powershell_path())
         .args(["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", command])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -553,6 +553,20 @@ fn run_powershell_wait(command: &str) -> Result<(), String> {
             truncate(&String::from_utf8_lossy(&output.stderr), 800)
         ))
     }
+}
+
+fn powershell_path() -> &'static str {
+    const CANDIDATES: [&str; 3] = [
+        "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+        "/mnt/c/Windows/System32/powershell.exe",
+        "powershell.exe",
+    ];
+    for candidate in CANDIDATES {
+        if candidate.contains('/') && Path::new(candidate).exists() {
+            return candidate;
+        }
+    }
+    "powershell.exe"
 }
 
 fn forward_to_agent(agent_url: &str, prompt: &str) -> Result<String, String> {
@@ -715,7 +729,7 @@ fn create_csv_and_open() -> Result<String, String> {
 }
 
 fn spawn_powershell(command: &str) -> Result<(), String> {
-    Command::new("powershell.exe")
+    Command::new(powershell_path())
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
