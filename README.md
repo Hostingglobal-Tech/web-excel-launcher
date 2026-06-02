@@ -66,3 +66,49 @@ http://localhost:8877/
 ```text
 샘플 CSV 만들어서 엑셀로 열어줘
 ```
+
+## Vultr + Tailscale + OpenAI Computer Use
+
+`src/tailscale_excel_bridge.rs`는 리모트 서버와 로컬 PC를 분리한 데모입니다.
+
+흐름:
+
+```text
+Vultr gateway -> Tailscale -> WSL local agent -> Windows Excel
+```
+
+일반 모드는 OpenAI API로 프롬프트를 분류한 뒤 local agent가 allowlist된 Excel 실행 명령만 수행합니다.
+
+Computer Use 모드는 OpenAI Responses API의 `gpt-5.5` + `tools: [{ "type": "computer" }]`를 사용합니다. local agent가 Windows 화면을 캡처하고, 모델이 반환한 `screenshot`, `keypress`, `type`, `click`, `wait` 액션을 제한적으로 실행합니다.
+
+### Local agent
+
+```bash
+rustc src/tailscale_excel_bridge.rs -O -o tailscale-excel-bridge
+export EXCEL_BRIDGE_TOKEN='set-a-private-random-token'
+export OPENAI_MODEL='gpt-5.5'
+./tailscale-excel-bridge agent 100.x.x.x:8788
+```
+
+실행 전 현재 셸에 `OPENAI_API_KEY` 환경변수가 설정되어 있어야 합니다.
+
+### Vultr gateway
+
+```bash
+rustc src/tailscale_excel_bridge.rs -O -o tailscale-excel-bridge
+export EXCEL_BRIDGE_TOKEN='same-private-random-token'
+./tailscale-excel-bridge gateway 100.y.y.y:8878 http://100.x.x.x:8788
+```
+
+브라우저에서 gateway 주소로 접속합니다.
+
+```text
+http://100.y.y.y:8878/
+```
+
+### Gateway endpoints
+
+- `POST /prompt` 일반 OpenAI 분류 모드
+- `POST /prompt-computer` OpenAI Computer Use 모드
+
+Computer Use 모드는 `previous_response_id` 기반 루프가 필요하므로 해당 모드에서만 `store=true`를 사용합니다.
