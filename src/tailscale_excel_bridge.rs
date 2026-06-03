@@ -10,6 +10,8 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SAMPLE_WORKBOOK: &[u8] = include_bytes!("../assets/sample-web-excel-launcher.xlsx");
+const DEFAULT_COMPUTER_MODEL: &str = "gpt-5.5";
+const DEFAULT_COMPUTER_MAX_STEPS: usize = 12;
 
 #[derive(Debug)]
 struct HttpRequest {
@@ -358,32 +360,49 @@ fn agent_execute_prompt_computer_use(prompt: &str) -> Response {
     }
 }
 
-fn openai_model() -> String {
-    env::var("OPENAI_MODEL").unwrap_or_else(|_| "computer-use-preview".to_string())
+fn openai_computer_model() -> String {
+    env::var("OPENAI_COMPUTER_MODEL")
+        .or_else(|_| env::var("OPENAI_MODEL"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_COMPUTER_MODEL.to_string())
+}
+
+fn computer_max_steps() -> usize {
+    env::var("OPENAI_COMPUTER_MAX_STEPS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| (1..=40).contains(value))
+        .unwrap_or(DEFAULT_COMPUTER_MAX_STEPS)
 }
 
 fn run_computer_use_excel(prompt: &str) -> Result<String, String> {
     let api_key = env::var("OPENAI_API_KEY")
         .map_err(|_| "OPENAI_API_KEY 환경변수가 로컬 agent에 없습니다.".to_string())?;
-    let model = openai_model();
-    // 좌표계 확정: tool 의 display_width/height = screenshot 픽셀 크기 = 실제 화면.
+    let model = openai_computer_model();
+    let max_steps = computer_max_steps();
+    // 좌표계 확정: screenshot 픽셀 크기 = 실제 Windows primary screen 좌표.
     let (sw, sh) = get_primary_screen_size()?;
     let mut log = String::new();
-    log.push_str("mode=OpenAI computer_use_preview\n");
+    log.push_str("mode=OpenAI computer\n");
     log.push_str(&format!("model={model}\n"));
-    log.push_str(&format!("display={sw}x{sh} (environment=windows)\n"));
+    log.push_str(&format!(
+        "coordinate_frame={sw}x{sh} primary_screen_pixels\n"
+    ));
     log.push_str("store=true (computer loop previous_response_id 필요)\n");
 
     let task = format!(
         "Windows desktop에서 Microsoft Excel을 실행해줘. \
-         시작 메뉴나 실행 창을 사용해도 된다. Excel 창이 열리면 더 이상 조작하지 말고 멈춰라. \
+         시작 메뉴나 실행 창을 사용해도 된다. \
+         첫 화면 확인이 필요하면 screenshot action을 먼저 요청하고, 이후 좌표 기반 click/type/keypress/scroll/drag/move action을 사용해라. \
+         Excel 창이 열리면 더 이상 조작하지 말고 멈춰라. \
+         Use the computer tool for UI interaction. \
          사용자 원문: {prompt}"
     );
-    // 초기 호출에도 현재 화면 screenshot 을 함께 보내 모델이 첫 step 부터 화면을 보게 한다.
-    let first_shot = capture_windows_screenshot_base64()?;
-    let mut body = call_openai_computer_initial(&api_key, &model, sw, sh, &task, &first_shot)?;
+    let mut body = call_openai_computer_initial(&api_key, &model, &task)?;
 
-    for step in 1..=10 {
+    for step in 1..=max_steps {
         let Some(call_id) = jq_first_string(
             &body,
             ".output[]? | select(.type==\"computer_call\") | .call_id",
@@ -392,27 +411,24 @@ fn run_computer_use_excel(prompt: &str) -> Result<String, String> {
             log.push_str(&format!("step={step} computer_call 없음, 종료\n"));
             return Ok(log);
         };
-        // OpenAI computer_call 의 action 은 단수 객체 .action (배열 .actions 아님).
         let action_lines = jq_lines(
             &body,
-            r#".output[]? | select(.type=="computer_call") | .action |
+            r#".output[]? | select(.type=="computer_call") |
+((.actions // (if .action then [.action] else [] end))[]) |
+def keys: ((.keys // []) | join("+"));
+def pt: if type=="array" then (((.[0] // 0)|tostring) + "," + ((.[1] // 0)|tostring)) else (((.x // 0)|tostring) + "," + ((.y // 0)|tostring)) end;
 if .type=="keypress" then "keypress\t" + ((.keys // []) | join("+"))
-elif .type=="type" then "type\t" + (.text // "")
-elif .type=="click" then "click\t" + ((.x // 0)|tostring) + "\t" + ((.y // 0)|tostring) + "\t" + (.button // "left")
-elif .type=="double_click" then "double_click\t" + ((.x // 0)|tostring) + "\t" + ((.y // 0)|tostring)
-elif .type=="move" then "move\t" + ((.x // 0)|tostring) + "\t" + ((.y // 0)|tostring)
-elif .type=="scroll" then "scroll\t" + ((.x // 0)|tostring) + "\t" + ((.y // 0)|tostring) + "\t" + ((.scroll_x // 0)|tostring) + "\t" + ((.scroll_y // 0)|tostring)
+elif .type=="type" then "type\t" + ((.text // "") | @base64)
+elif .type=="click" then "click\t" + ((.x // 0)|tostring) + "\t" + ((.y // 0)|tostring) + "\t" + (.button // "left") + "\t" + keys
+elif .type=="double_click" then "double_click\t" + ((.x // 0)|tostring) + "\t" + ((.y // 0)|tostring) + "\t" + (.button // "left") + "\t" + keys
+elif .type=="move" then "move\t" + ((.x // 0)|tostring) + "\t" + ((.y // 0)|tostring) + "\t" + keys
+elif .type=="scroll" then "scroll\t" + ((.x // 0)|tostring) + "\t" + ((.y // 0)|tostring) + "\t" + ((.scrollX // .scroll_x // 0)|tostring) + "\t" + ((.scrollY // .scroll_y // 0)|tostring) + "\t" + keys
+elif .type=="drag" then "drag\t" + ((.path // []) | map(pt) | join(";")) + "\t" + keys
 elif .type=="wait" then "wait"
 elif .type=="screenshot" then "screenshot"
 else "unsupported\t" + (.type // "null")
 end"#,
         )?;
-        // 모델이 승인 요구하는 pending_safety_checks 를 그대로 echo (compact JSON array).
-        let safety_checks = jq_raw(
-            &body,
-            ".output[]? | select(.type==\"computer_call\") | (.pending_safety_checks // [])",
-        )?
-        .unwrap_or_else(|| "[]".to_string());
 
         if action_lines.is_empty() {
             log.push_str(&format!("step={step} action 없음, 종료\n"));
@@ -422,13 +438,10 @@ end"#,
         log.push_str(&format!("step={step} call_id={call_id}\n"));
         for line in &action_lines {
             log.push_str("action=");
-            log.push_str(line);
+            log.push_str(&format_computer_action_for_log(line));
             log.push('\n');
         }
-        if safety_checks != "[]" {
-            log.push_str(&format!("ack_safety_checks={safety_checks}\n"));
-        }
-        execute_computer_action_lines(&action_lines, &mut log)?;
+        execute_computer_action_lines(&action_lines, sw, sh)?;
         thread::sleep(std::time::Duration::from_millis(1000));
 
         if excel_process_seen() {
@@ -442,12 +455,9 @@ end"#,
         body = call_openai_computer_screenshot(
             &api_key,
             &model,
-            sw,
-            sh,
             &response_id,
             &call_id,
             &screenshot_b64,
-            &safety_checks,
         )?;
 
         if excel_process_seen() {
@@ -458,29 +468,11 @@ end"#,
     Ok(log)
 }
 
-// computer_use_preview tool config. display_width/height + environment 필수.
-fn computer_tool_json(display_w: i32, display_h: i32) -> String {
-    format!(
-        "{{\"type\":\"computer_use_preview\",\"display_width\":{display_w},\"display_height\":{display_h},\"environment\":\"windows\"}}"
-    )
-}
-
-fn call_openai_computer_initial(
-    api_key: &str,
-    model: &str,
-    display_w: i32,
-    display_h: i32,
-    task: &str,
-    screenshot_b64: &str,
-) -> Result<String, String> {
-    let image_url = format!("data:image/png;base64,{screenshot_b64}");
-    // input: 사용자 텍스트 + 초기 화면 image 한 묶음.
+fn call_openai_computer_initial(api_key: &str, model: &str, task: &str) -> Result<String, String> {
     let payload = format!(
-        "{{\"model\":{},\"tools\":[{}],\"truncation\":\"auto\",\"input\":[{{\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":{}}},{{\"type\":\"input_image\",\"image_url\":{}}}]}}],\"max_output_tokens\":512,\"store\":true}}",
+        "{{\"model\":{},\"tools\":[{{\"type\":\"computer\"}}],\"input\":{},\"max_output_tokens\":1024,\"store\":true}}",
         json_string(model),
-        computer_tool_json(display_w, display_h),
-        json_string(task),
-        json_string(&image_url)
+        json_string(task)
     );
     call_openai_json(api_key, &payload)
 }
@@ -488,21 +480,16 @@ fn call_openai_computer_initial(
 fn call_openai_computer_screenshot(
     api_key: &str,
     model: &str,
-    display_w: i32,
-    display_h: i32,
     previous_response_id: &str,
     call_id: &str,
     screenshot_b64: &str,
-    acknowledged_safety_checks: &str,
 ) -> Result<String, String> {
     let image_url = format!("data:image/png;base64,{screenshot_b64}");
     let payload = format!(
-        "{{\"model\":{},\"tools\":[{}],\"truncation\":\"auto\",\"previous_response_id\":{},\"input\":[{{\"type\":\"computer_call_output\",\"call_id\":{},\"acknowledged_safety_checks\":{},\"output\":{{\"type\":\"computer_screenshot\",\"image_url\":{}}}}}],\"max_output_tokens\":512,\"store\":true}}",
+        "{{\"model\":{},\"tools\":[{{\"type\":\"computer\"}}],\"previous_response_id\":{},\"input\":[{{\"type\":\"computer_call_output\",\"call_id\":{},\"output\":{{\"type\":\"computer_screenshot\",\"image_url\":{},\"detail\":\"original\"}}}}],\"max_output_tokens\":1024,\"store\":true}}",
         json_string(model),
-        computer_tool_json(display_w, display_h),
         json_string(previous_response_id),
         json_string(call_id),
-        acknowledged_safety_checks,
         json_string(&image_url)
     );
     call_openai_json(api_key, &payload)
@@ -557,35 +544,6 @@ fn jq_first_string(input: &str, filter: &str) -> Result<Option<String>, String> 
         .find(|line| !line.trim().is_empty() && line.trim() != "null"))
 }
 
-// jq -c 로 compact JSON 한 줄 추출 (배열/객체 원형 echo 용, 예: pending_safety_checks).
-fn jq_raw(input: &str, filter: &str) -> Result<Option<String>, String> {
-    let mut child = Command::new("jq")
-        .args(["-c", filter])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("jq 실행 실패: {err}"))?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(input.as_bytes())
-            .map_err(|err| format!("jq stdin 쓰기 실패: {err}"))?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("jq 대기 실패: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "jq 실패: {}",
-            truncate(&String::from_utf8_lossy(&output.stderr), 400)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .find(|l| !l.is_empty() && l != "null"))
-}
-
 fn jq_lines(input: &str, filter: &str) -> Result<Vec<String>, String> {
     let mut child = Command::new("jq")
         .args(["-r", filter])
@@ -614,7 +572,11 @@ fn jq_lines(input: &str, filter: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn execute_computer_action_lines(lines: &[String], log: &mut String) -> Result<(), String> {
+fn execute_computer_action_lines(
+    lines: &[String],
+    screen_width: i32,
+    screen_height: i32,
+) -> Result<(), String> {
     for line in lines {
         if line.trim().is_empty() {
             continue;
@@ -629,56 +591,185 @@ fn execute_computer_action_lines(lines: &[String], log: &mut String) -> Result<(
                 thread::sleep(std::time::Duration::from_millis(400));
             }
             "type" => {
-                let text = parts.next().unwrap_or("");
-                type_text(text)?;
+                let text = base64_decode_utf8(parts.next().unwrap_or(""))?;
+                type_text(&text)?;
                 thread::sleep(std::time::Duration::from_millis(400));
             }
             "click" => {
-                let x = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
-                let y = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
-                click_mouse(x, y, false)?;
+                let (x, y) = clamped_point(
+                    parts.next().unwrap_or("0"),
+                    parts.next().unwrap_or("0"),
+                    screen_width,
+                    screen_height,
+                )?;
+                let button = parts.next().unwrap_or("left");
+                let keys = parts.next().unwrap_or("");
+                with_modifier_keys(keys, || click_mouse(x, y, button, false))?;
                 thread::sleep(std::time::Duration::from_millis(400));
             }
             "double_click" => {
-                let x = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
-                let y = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
-                click_mouse(x, y, true)?;
+                let (x, y) = clamped_point(
+                    parts.next().unwrap_or("0"),
+                    parts.next().unwrap_or("0"),
+                    screen_width,
+                    screen_height,
+                )?;
+                let button = parts.next().unwrap_or("left");
+                let keys = parts.next().unwrap_or("");
+                with_modifier_keys(keys, || click_mouse(x, y, button, true))?;
                 thread::sleep(std::time::Duration::from_millis(400));
             }
             "move" => {
-                let x = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
-                let y = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
-                move_mouse(x, y)?;
+                let (x, y) = clamped_point(
+                    parts.next().unwrap_or("0"),
+                    parts.next().unwrap_or("0"),
+                    screen_width,
+                    screen_height,
+                )?;
+                let keys = parts.next().unwrap_or("");
+                with_modifier_keys(keys, || move_mouse(x, y))?;
             }
             "scroll" => {
-                let x = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
-                let y = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
-                let _sx = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
-                let sy = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
-                scroll_mouse(x, y, sy)?;
-                thread::sleep(std::time::Duration::from_millis(300));
+                let (x, y) = clamped_point(
+                    parts.next().unwrap_or("0"),
+                    parts.next().unwrap_or("0"),
+                    screen_width,
+                    screen_height,
+                )?;
+                let scroll_x = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
+                let scroll_y = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
+                let keys = parts.next().unwrap_or("");
+                with_modifier_keys(keys, || scroll_mouse(x, y, scroll_x, scroll_y))?;
+                thread::sleep(std::time::Duration::from_millis(400));
             }
-            // 모르는 action 은 루프 중단 대신 skip (drag 등). 한 액션이 전체를 죽이지 않게.
-            other => {
-                log.push_str(&format!("skip=미지원 action {other}\n"));
+            "drag" => {
+                let path =
+                    parse_drag_path(parts.next().unwrap_or(""), screen_width, screen_height)?;
+                let keys = parts.next().unwrap_or("");
+                with_modifier_keys(keys, || drag_mouse(&path, "left"))?;
+                thread::sleep(std::time::Duration::from_millis(400));
             }
+            other => return Err(format!("지원하지 않는 computer action: {other}")),
         }
     }
     Ok(())
 }
 
-// 휠 스크롤. scroll_y>0 = 아래로(콘텐츠 위로), WHEEL_DELTA 120 단위.
-fn scroll_mouse(x: i32, y: i32, scroll_y: i32) -> Result<(), String> {
-    let delta = -scroll_y * 120;
+fn format_computer_action_for_log(line: &str) -> String {
+    let mut parts = line.split('\t');
+    match parts.next().unwrap_or("") {
+        "type" => match base64_decode_utf8(parts.next().unwrap_or("")) {
+            Ok(text) => format!("type text_len={}", text.chars().count()),
+            Err(_) => "type text_decode_error".to_string(),
+        },
+        other => {
+            let rest = parts.collect::<Vec<_>>().join("\t");
+            if rest.is_empty() {
+                other.to_string()
+            } else {
+                format!("{other}\t{rest}")
+            }
+        }
+    }
+}
+
+fn clamped_point(
+    x: &str,
+    y: &str,
+    screen_width: i32,
+    screen_height: i32,
+) -> Result<(i32, i32), String> {
+    if screen_width <= 0 || screen_height <= 0 {
+        return Err(format!("비정상 화면 크기: {screen_width}x{screen_height}"));
+    }
+    let x = x.parse::<i32>().unwrap_or(0);
+    let y = y.parse::<i32>().unwrap_or(0);
+    Ok((
+        x.clamp(0, screen_width.saturating_sub(1)),
+        y.clamp(0, screen_height.saturating_sub(1)),
+    ))
+}
+
+fn parse_drag_path(
+    path: &str,
+    screen_width: i32,
+    screen_height: i32,
+) -> Result<Vec<(i32, i32)>, String> {
+    let points = path
+        .split(';')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            let (x, y) = part
+                .split_once(',')
+                .ok_or_else(|| format!("drag 좌표 파싱 실패: {part}"))?;
+            clamped_point(x.trim(), y.trim(), screen_width, screen_height)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if points.len() < 2 {
+        return Err("drag action에는 최소 두 좌표가 필요합니다.".to_string());
+    }
+    Ok(points)
+}
+
+fn base64_decode_utf8(encoded: &str) -> Result<String, String> {
+    let mut child = Command::new("base64")
+        .arg("-d")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("base64 -d 실행 실패: {err}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(encoded.as_bytes())
+            .map_err(|err| format!("base64 stdin 쓰기 실패: {err}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("base64 대기 실패: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "base64 decode 실패: {}",
+            truncate(&String::from_utf8_lossy(&output.stderr), 400)
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|err| format!("type text UTF-8 decode 실패: {err}"))
+}
+
+fn scroll_mouse(x: i32, y: i32, scroll_x: i32, scroll_y: i32) -> Result<(), String> {
+    let horizontal = normalize_wheel_delta(scroll_x);
+    let vertical = normalize_wheel_delta(-scroll_y);
     let ps = format!(
-        "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class S {{ [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X, int Y); [DllImport(\"user32.dll\")] public static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo); }}\n'@; [S]::SetCursorPos({x},{y}) | Out-Null; [S]::mouse_event(0x0800,0,0,{delta},0)"
+        "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class S {{ [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X, int Y); [DllImport(\"user32.dll\")] public static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo); }}\n'@; [S]::SetCursorPos({x},{y}) | Out-Null; if ({vertical} -ne 0) {{ [S]::mouse_event(0x0800,0,0,{vertical},0); }} if ({horizontal} -ne 0) {{ [S]::mouse_event(0x1000,0,0,{horizontal},0); }}"
     );
     run_powershell_wait(&ps)
 }
 
-// OpenAI computer_use_preview 는 좌표계를 알아야 한다. PrimaryScreen 픽셀 크기를
-// tool config 의 display_width/height 로 넘기고, 같은 크기로 screenshot 을 보내야
-// 모델이 반환하는 (x,y) 가 실제 화면 좌표와 1:1 로 맞는다. (좌표 어긋남 핵심 원인)
+fn drag_mouse(path: &[(i32, i32)], button: &str) -> Result<(), String> {
+    let (down_flag, up_flag) = mouse_button_flags(button)?;
+    let mut moves = String::new();
+    for (x, y) in path.iter().skip(1) {
+        moves.push_str(&format!(
+            "Start-Sleep -Milliseconds 60; [D]::SetCursorPos({x},{y}) | Out-Null;"
+        ));
+    }
+    let (start_x, start_y) = path[0];
+    let ps = format!(
+        "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class D {{ [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X, int Y); [DllImport(\"user32.dll\")] public static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo); }}\n'@; [D]::SetCursorPos({start_x},{start_y}) | Out-Null; [D]::mouse_event({down_flag},0,0,0,0); {moves} Start-Sleep -Milliseconds 60; [D]::mouse_event({up_flag},0,0,0,0);"
+    );
+    run_powershell_wait(&ps)
+}
+
+fn normalize_wheel_delta(delta: i32) -> i32 {
+    if delta == 0 {
+        return 0;
+    }
+    let sign = if delta > 0 { 1 } else { -1 };
+    sign * delta.abs().max(120)
+}
+
+// Computer Use 좌표는 screenshot 픽셀 기준이다. PrimaryScreen 원본 크기로
+// 캡처하고 같은 좌표계로 SetCursorPos 를 호출해야 (x,y)가 1:1로 맞는다.
 fn get_primary_screen_size() -> Result<(i32, i32), String> {
     let ps = "Add-Type -AssemblyName System.Windows.Forms; \
               $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
@@ -700,8 +791,14 @@ fn get_primary_screen_size() -> Result<(i32, i32), String> {
     let (w, h) = line
         .split_once('x')
         .ok_or_else(|| format!("screen size 파싱 실패: {line:?}"))?;
-    let w = w.trim().parse::<i32>().map_err(|_| "width 파싱 실패".to_string())?;
-    let h = h.trim().parse::<i32>().map_err(|_| "height 파싱 실패".to_string())?;
+    let w = w
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| "width 파싱 실패".to_string())?;
+    let h = h
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| "height 파싱 실패".to_string())?;
     if w <= 0 || h <= 0 {
         return Err(format!("비정상 screen size: {w}x{h}"));
     }
@@ -737,26 +834,45 @@ fn capture_windows_screenshot_base64() -> Result<String, String> {
 }
 
 fn press_keys(keys: &str) -> Result<(), String> {
-    let codes: Vec<u8> = keys
-        .split('+')
-        .filter_map(|key| key_to_vk(key.trim()))
-        .collect();
+    let codes = key_codes(keys)?;
     if codes.is_empty() {
         return Err(format!("keypress 키를 해석하지 못했습니다: {keys}"));
     }
-    let down = codes
+    send_key_events(&codes, true)?;
+    thread::sleep(std::time::Duration::from_millis(80));
+    send_key_events(&codes, false)
+}
+
+fn key_codes(keys: &str) -> Result<Vec<u8>, String> {
+    let codes = keys
+        .split('+')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .filter_map(key_to_vk)
+        .collect::<Vec<_>>();
+    if !keys.trim().is_empty() && codes.is_empty() {
+        return Err(format!("키를 해석하지 못했습니다: {keys}"));
+    }
+    Ok(codes)
+}
+
+fn send_key_events(codes: &[u8], down: bool) -> Result<(), String> {
+    if codes.is_empty() {
+        return Ok(());
+    }
+    let flags = if down { 0 } else { 2 };
+    let ordered = if down {
+        codes.iter().copied().collect::<Vec<_>>()
+    } else {
+        codes.iter().rev().copied().collect::<Vec<_>>()
+    };
+    let events = ordered
         .iter()
-        .map(|code| format!("[K]::keybd_event({code},0,0,0);"))
-        .collect::<Vec<_>>()
-        .join("");
-    let up = codes
-        .iter()
-        .rev()
-        .map(|code| format!("[K]::keybd_event({code},0,2,0);"))
+        .map(|code| format!("[K]::keybd_event({code},0,{flags},0);"))
         .collect::<Vec<_>>()
         .join("");
     let ps = format!(
-        "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class K {{ [DllImport(\"user32.dll\")] public static extern void keybd_event(byte bVk, byte bScan, int dwFlags, int dwExtraInfo); }}\n'@; {down} Start-Sleep -Milliseconds 80; {up}"
+        "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class K {{ [DllImport(\"user32.dll\")] public static extern void keybd_event(byte bVk, byte bScan, int dwFlags, int dwExtraInfo); }}\n'@; {events}"
     );
     run_powershell_wait(&ps)
 }
@@ -771,6 +887,10 @@ fn key_to_vk(key: &str) -> Option<u8> {
         "SPACE" => Some(0x20),
         "BACKSPACE" => Some(0x08),
         "DELETE" | "DEL" => Some(0x2E),
+        "HOME" => Some(0x24),
+        "END" => Some(0x23),
+        "PAGEUP" | "PGUP" => Some(0x21),
+        "PAGEDOWN" | "PGDN" => Some(0x22),
         "CTRL" | "CONTROL" => Some(0x11),
         "SHIFT" => Some(0x10),
         "ALT" | "OPTION" => Some(0x12),
@@ -784,20 +904,22 @@ fn key_to_vk(key: &str) -> Option<u8> {
 }
 
 fn type_text(text: &str) -> Result<(), String> {
-    let safe: String = text
-        .chars()
-        .filter(|ch| {
-            ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '.' | '-' | '_' | ':' | '\\' | '/')
-        })
-        .collect();
-    if safe.is_empty() {
+    if text.is_empty() {
         return Err("type action 텍스트가 비어 있거나 허용 문자가 아닙니다.".to_string());
     }
+    let text_path = write_secret_temp("cua-type", ".txt", text)?;
+    let win_path = wsl_to_windows_path(&text_path)
+        .ok_or_else(|| format!("Windows 경로 변환 실패: {text_path:?}"))?;
     let ps = format!(
-        "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait({})",
-        powershell_single_quote(&safe)
+        "Add-Type -AssemblyName System.Windows.Forms; \
+         $text = Get-Content -LiteralPath {} -Raw -Encoding UTF8; \
+         [System.Windows.Forms.Clipboard]::SetText($text); \
+         [System.Windows.Forms.SendKeys]::SendWait('^v')",
+        powershell_single_quote(&win_path)
     );
-    run_powershell_wait(&ps)
+    let result = run_powershell_wait(&ps);
+    let _ = fs::remove_file(&text_path);
+    result
 }
 
 fn move_mouse(x: i32, y: i32) -> Result<(), String> {
@@ -807,12 +929,37 @@ fn move_mouse(x: i32, y: i32) -> Result<(), String> {
     run_powershell_wait(&ps)
 }
 
-fn click_mouse(x: i32, y: i32, double_click: bool) -> Result<(), String> {
+fn click_mouse(x: i32, y: i32, button: &str, double_click: bool) -> Result<(), String> {
+    let (down_flag, up_flag) = mouse_button_flags(button)?;
     let repeat = if double_click { 2 } else { 1 };
     let ps = format!(
-        "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class M {{ [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X, int Y); [DllImport(\"user32.dll\")] public static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo); }}\n'@; [M]::SetCursorPos({x},{y}) | Out-Null; for ($i=0; $i -lt {repeat}; $i++) {{ [M]::mouse_event(2,0,0,0,0); Start-Sleep -Milliseconds 60; [M]::mouse_event(4,0,0,0,0); Start-Sleep -Milliseconds 120; }}"
+        "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class M {{ [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X, int Y); [DllImport(\"user32.dll\")] public static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo); }}\n'@; [M]::SetCursorPos({x},{y}) | Out-Null; for ($i=0; $i -lt {repeat}; $i++) {{ [M]::mouse_event({down_flag},0,0,0,0); Start-Sleep -Milliseconds 60; [M]::mouse_event({up_flag},0,0,0,0); Start-Sleep -Milliseconds 120; }}"
     );
     run_powershell_wait(&ps)
+}
+
+fn mouse_button_flags(button: &str) -> Result<(i32, i32), String> {
+    match button.to_ascii_lowercase().as_str() {
+        "" | "left" => Ok((2, 4)),
+        "right" => Ok((8, 16)),
+        "middle" => Ok((32, 64)),
+        other => Err(format!("지원하지 않는 mouse button: {other}")),
+    }
+}
+
+fn with_modifier_keys<F>(keys: &str, action: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let codes = key_codes(keys)?;
+    if codes.is_empty() {
+        return action();
+    }
+    send_key_events(&codes, true)?;
+    thread::sleep(std::time::Duration::from_millis(60));
+    let action_result = action();
+    let release_result = send_key_events(&codes, false);
+    action_result.and(release_result)
 }
 
 fn excel_process_seen() -> bool {

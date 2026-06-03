@@ -88,11 +88,25 @@ gpt-5.5 + tools: [{ "type": "computer" }]
 
 local agent가 수행하는 일:
 
-1. Windows 화면 캡처
-2. OpenAI에 screenshot 전달
-3. 모델이 반환한 `screenshot`, `keypress`, `type`, `click`, `wait` 액션 실행
-4. 새 screenshot을 다시 전달
-5. `computer_call`이 끝날 때까지 반복
+1. OpenAI Responses API에 `tools: [{ "type": "computer" }]` 요청
+2. 모델이 `screenshot`을 요청하면 Windows primary screen을 PNG로 캡처
+3. `detail: "original"` screenshot을 `computer_call_output`으로 전달
+4. 모델이 반환한 `screenshot`, `click`, `double_click`, `scroll`, `type`, `wait`, `keypress`, `drag`, `move` 액션 실행
+5. 새 screenshot을 다시 전달
+6. `computer_call`이 끝날 때까지 반복
+
+좌표 기준:
+
+- screenshot은 Windows `PrimaryScreen.Bounds` 원본 픽셀 크기로 캡처합니다.
+- mouse action은 같은 픽셀 좌표계를 `SetCursorPos`로 실행합니다.
+- 모델 좌표가 화면 밖으로 벗어나면 primary screen 안으로 clamp합니다.
+- `type` 액션은 한글/개행 보존을 위해 clipboard paste 방식으로 입력합니다.
+
+설정:
+
+- Computer Use 기본 model: `gpt-5.5`
+- override: `OPENAI_COMPUTER_MODEL`
+- loop step override: `OPENAI_COMPUTER_MAX_STEPS` (`1..40`, 기본 `12`)
 
 Computer Use 모드는 `previous_response_id` 기반 루프가 필요하므로 이 모드에서만 `store=true`를 사용합니다.
 
@@ -329,13 +343,14 @@ curl -X POST http://100.y.y.y:8878/prompt-computer \
 성공 로그 예:
 
 ```text
-mode=OpenAI computer tool
+mode=OpenAI computer
 model=gpt-5.5
+coordinate_frame=1920x1080 primary_screen_pixels
 store=true (computer loop previous_response_id 필요)
 step=1 action=screenshot
-step=2 action=keypress WIN+R
-step=2 action=type excel
-step=2 action=keypress ENTER
+step=2 action=keypress	WIN+R
+step=2 action=type text_len=5
+step=2 action=keypress	ENTER
 verify=EXCEL.EXE 감지됨
 ```
 
