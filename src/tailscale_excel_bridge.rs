@@ -358,12 +358,20 @@ fn agent_execute_prompt_computer_use(prompt: &str) -> Response {
     }
 }
 
+fn openai_model() -> String {
+    env::var("OPENAI_MODEL").unwrap_or_else(|_| "computer-use-preview".to_string())
+}
+
 fn run_computer_use_excel(prompt: &str) -> Result<String, String> {
     let api_key = env::var("OPENAI_API_KEY")
         .map_err(|_| "OPENAI_API_KEY 환경변수가 로컬 agent에 없습니다.".to_string())?;
+    let model = openai_model();
+    // 좌표계 확정: tool 의 display_width/height = screenshot 픽셀 크기 = 실제 화면.
+    let (sw, sh) = get_primary_screen_size()?;
     let mut log = String::new();
-    log.push_str("mode=OpenAI computer tool\n");
-    log.push_str("model=gpt-5.5\n");
+    log.push_str("mode=OpenAI computer_use_preview\n");
+    log.push_str(&format!("model={model}\n"));
+    log.push_str(&format!("display={sw}x{sh} (environment=windows)\n"));
     log.push_str("store=true (computer loop previous_response_id 필요)\n");
 
     let task = format!(
@@ -371,9 +379,11 @@ fn run_computer_use_excel(prompt: &str) -> Result<String, String> {
          시작 메뉴나 실행 창을 사용해도 된다. Excel 창이 열리면 더 이상 조작하지 말고 멈춰라. \
          사용자 원문: {prompt}"
     );
-    let mut body = call_openai_computer_initial(&api_key, &task)?;
+    // 초기 호출에도 현재 화면 screenshot 을 함께 보내 모델이 첫 step 부터 화면을 보게 한다.
+    let first_shot = capture_windows_screenshot_base64()?;
+    let mut body = call_openai_computer_initial(&api_key, &model, sw, sh, &task, &first_shot)?;
 
-    for step in 1..=8 {
+    for step in 1..=10 {
         let Some(call_id) = jq_first_string(
             &body,
             ".output[]? | select(.type==\"computer_call\") | .call_id",
@@ -382,19 +392,27 @@ fn run_computer_use_excel(prompt: &str) -> Result<String, String> {
             log.push_str(&format!("step={step} computer_call 없음, 종료\n"));
             return Ok(log);
         };
+        // OpenAI computer_call 의 action 은 단수 객체 .action (배열 .actions 아님).
         let action_lines = jq_lines(
             &body,
-            r#".output[]? | select(.type=="computer_call") | .actions[]? |
+            r#".output[]? | select(.type=="computer_call") | .action |
 if .type=="keypress" then "keypress\t" + ((.keys // []) | join("+"))
 elif .type=="type" then "type\t" + (.text // "")
 elif .type=="click" then "click\t" + ((.x // 0)|tostring) + "\t" + ((.y // 0)|tostring) + "\t" + (.button // "left")
 elif .type=="double_click" then "double_click\t" + ((.x // 0)|tostring) + "\t" + ((.y // 0)|tostring)
 elif .type=="move" then "move\t" + ((.x // 0)|tostring) + "\t" + ((.y // 0)|tostring)
+elif .type=="scroll" then "scroll\t" + ((.x // 0)|tostring) + "\t" + ((.y // 0)|tostring) + "\t" + ((.scroll_x // 0)|tostring) + "\t" + ((.scroll_y // 0)|tostring)
 elif .type=="wait" then "wait"
 elif .type=="screenshot" then "screenshot"
-else "unsupported\t" + .type
+else "unsupported\t" + (.type // "null")
 end"#,
         )?;
+        // 모델이 승인 요구하는 pending_safety_checks 를 그대로 echo (compact JSON array).
+        let safety_checks = jq_raw(
+            &body,
+            ".output[]? | select(.type==\"computer_call\") | (.pending_safety_checks // [])",
+        )?
+        .unwrap_or_else(|| "[]".to_string());
 
         if action_lines.is_empty() {
             log.push_str(&format!("step={step} action 없음, 종료\n"));
@@ -407,7 +425,10 @@ end"#,
             log.push_str(line);
             log.push('\n');
         }
-        execute_computer_action_lines(&action_lines)?;
+        if safety_checks != "[]" {
+            log.push_str(&format!("ack_safety_checks={safety_checks}\n"));
+        }
+        execute_computer_action_lines(&action_lines, &mut log)?;
         thread::sleep(std::time::Duration::from_millis(1000));
 
         if excel_process_seen() {
@@ -418,7 +439,16 @@ end"#,
         let screenshot_b64 = capture_windows_screenshot_base64()?;
         let response_id = jq_first_string(&body, ".id")?
             .ok_or_else(|| "OpenAI response id를 찾지 못했습니다.".to_string())?;
-        body = call_openai_computer_screenshot(&api_key, &response_id, &call_id, &screenshot_b64)?;
+        body = call_openai_computer_screenshot(
+            &api_key,
+            &model,
+            sw,
+            sh,
+            &response_id,
+            &call_id,
+            &screenshot_b64,
+            &safety_checks,
+        )?;
 
         if excel_process_seen() {
             log.push_str("verify=EXCEL.EXE 감지됨\n");
@@ -428,25 +458,51 @@ end"#,
     Ok(log)
 }
 
-fn call_openai_computer_initial(api_key: &str, task: &str) -> Result<String, String> {
+// computer_use_preview tool config. display_width/height + environment 필수.
+fn computer_tool_json(display_w: i32, display_h: i32) -> String {
+    format!(
+        "{{\"type\":\"computer_use_preview\",\"display_width\":{display_w},\"display_height\":{display_h},\"environment\":\"windows\"}}"
+    )
+}
+
+fn call_openai_computer_initial(
+    api_key: &str,
+    model: &str,
+    display_w: i32,
+    display_h: i32,
+    task: &str,
+    screenshot_b64: &str,
+) -> Result<String, String> {
+    let image_url = format!("data:image/png;base64,{screenshot_b64}");
+    // input: 사용자 텍스트 + 초기 화면 image 한 묶음.
     let payload = format!(
-        "{{\"model\":\"gpt-5.5\",\"tools\":[{{\"type\":\"computer\"}}],\"input\":{},\"max_output_tokens\":512,\"store\":true}}",
-        json_string(task)
+        "{{\"model\":{},\"tools\":[{}],\"truncation\":\"auto\",\"input\":[{{\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":{}}},{{\"type\":\"input_image\",\"image_url\":{}}}]}}],\"max_output_tokens\":512,\"store\":true}}",
+        json_string(model),
+        computer_tool_json(display_w, display_h),
+        json_string(task),
+        json_string(&image_url)
     );
     call_openai_json(api_key, &payload)
 }
 
 fn call_openai_computer_screenshot(
     api_key: &str,
+    model: &str,
+    display_w: i32,
+    display_h: i32,
     previous_response_id: &str,
     call_id: &str,
     screenshot_b64: &str,
+    acknowledged_safety_checks: &str,
 ) -> Result<String, String> {
     let image_url = format!("data:image/png;base64,{screenshot_b64}");
     let payload = format!(
-        "{{\"model\":\"gpt-5.5\",\"tools\":[{{\"type\":\"computer\"}}],\"previous_response_id\":{},\"input\":[{{\"type\":\"computer_call_output\",\"call_id\":{},\"output\":{{\"type\":\"computer_screenshot\",\"image_url\":{},\"detail\":\"original\"}}}}],\"max_output_tokens\":512,\"store\":true}}",
+        "{{\"model\":{},\"tools\":[{}],\"truncation\":\"auto\",\"previous_response_id\":{},\"input\":[{{\"type\":\"computer_call_output\",\"call_id\":{},\"acknowledged_safety_checks\":{},\"output\":{{\"type\":\"computer_screenshot\",\"image_url\":{}}}}}],\"max_output_tokens\":512,\"store\":true}}",
+        json_string(model),
+        computer_tool_json(display_w, display_h),
         json_string(previous_response_id),
         json_string(call_id),
+        acknowledged_safety_checks,
         json_string(&image_url)
     );
     call_openai_json(api_key, &payload)
@@ -501,6 +557,35 @@ fn jq_first_string(input: &str, filter: &str) -> Result<Option<String>, String> 
         .find(|line| !line.trim().is_empty() && line.trim() != "null"))
 }
 
+// jq -c 로 compact JSON 한 줄 추출 (배열/객체 원형 echo 용, 예: pending_safety_checks).
+fn jq_raw(input: &str, filter: &str) -> Result<Option<String>, String> {
+    let mut child = Command::new("jq")
+        .args(["-c", filter])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("jq 실행 실패: {err}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(input.as_bytes())
+            .map_err(|err| format!("jq stdin 쓰기 실패: {err}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("jq 대기 실패: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "jq 실패: {}",
+            truncate(&String::from_utf8_lossy(&output.stderr), 400)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .find(|l| !l.is_empty() && l != "null"))
+}
+
 fn jq_lines(input: &str, filter: &str) -> Result<Vec<String>, String> {
     let mut child = Command::new("jq")
         .args(["-r", filter])
@@ -529,7 +614,7 @@ fn jq_lines(input: &str, filter: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn execute_computer_action_lines(lines: &[String]) -> Result<(), String> {
+fn execute_computer_action_lines(lines: &[String], log: &mut String) -> Result<(), String> {
     for line in lines {
         if line.trim().is_empty() {
             continue;
@@ -565,10 +650,62 @@ fn execute_computer_action_lines(lines: &[String]) -> Result<(), String> {
                 let y = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
                 move_mouse(x, y)?;
             }
-            other => return Err(format!("지원하지 않는 computer action: {other}")),
+            "scroll" => {
+                let x = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
+                let y = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
+                let _sx = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
+                let sy = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
+                scroll_mouse(x, y, sy)?;
+                thread::sleep(std::time::Duration::from_millis(300));
+            }
+            // 모르는 action 은 루프 중단 대신 skip (drag 등). 한 액션이 전체를 죽이지 않게.
+            other => {
+                log.push_str(&format!("skip=미지원 action {other}\n"));
+            }
         }
     }
     Ok(())
+}
+
+// 휠 스크롤. scroll_y>0 = 아래로(콘텐츠 위로), WHEEL_DELTA 120 단위.
+fn scroll_mouse(x: i32, y: i32, scroll_y: i32) -> Result<(), String> {
+    let delta = -scroll_y * 120;
+    let ps = format!(
+        "Add-Type @'\nusing System; using System.Runtime.InteropServices; public class S {{ [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X, int Y); [DllImport(\"user32.dll\")] public static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo); }}\n'@; [S]::SetCursorPos({x},{y}) | Out-Null; [S]::mouse_event(0x0800,0,0,{delta},0)"
+    );
+    run_powershell_wait(&ps)
+}
+
+// OpenAI computer_use_preview 는 좌표계를 알아야 한다. PrimaryScreen 픽셀 크기를
+// tool config 의 display_width/height 로 넘기고, 같은 크기로 screenshot 을 보내야
+// 모델이 반환하는 (x,y) 가 실제 화면 좌표와 1:1 로 맞는다. (좌표 어긋남 핵심 원인)
+fn get_primary_screen_size() -> Result<(i32, i32), String> {
+    let ps = "Add-Type -AssemblyName System.Windows.Forms; \
+              $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
+              Write-Output (\"{0}x{1}\" -f $b.Width,$b.Height)";
+    let out = Command::new(powershell_path())
+        .args(["-NoProfile", "-Command", ps])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("screen size powershell 실패: {err}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "screen size 조회 실패: {}",
+            truncate(&String::from_utf8_lossy(&out.stderr), 400)
+        ));
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let line = s.trim().lines().last().unwrap_or("").trim();
+    let (w, h) = line
+        .split_once('x')
+        .ok_or_else(|| format!("screen size 파싱 실패: {line:?}"))?;
+    let w = w.trim().parse::<i32>().map_err(|_| "width 파싱 실패".to_string())?;
+    let h = h.trim().parse::<i32>().map_err(|_| "height 파싱 실패".to_string())?;
+    if w <= 0 || h <= 0 {
+        return Err(format!("비정상 screen size: {w}x{h}"));
+    }
+    Ok((w, h))
 }
 
 fn capture_windows_screenshot_base64() -> Result<String, String> {
