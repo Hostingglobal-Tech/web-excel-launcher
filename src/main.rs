@@ -59,12 +59,14 @@ fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
         ("GET", "/open-csv") => {
             action_response("수동 실행", "CSV 생성 후 엑셀 실행", create_csv_and_open())
         }
-        // Real web spreadsheet: 302 the requester's browser straight to Google Sheets.
-        // Uses that browser's existing leinhard@gmail.com login. No local program launch.
-        ("GET", "/open-google-sheets") => ("302 Found", "", google_sheets_new_url()),
-        // Server-side proof of Google auth: create a real sheet in Drive via Sheets API,
-        // write sample rows, then redirect to its live cloud URL.
-        ("GET", "/create-gsheet") | ("POST", "/create-gsheet") => create_gsheet_response(),
+        ("GET", "/open-google-sheets") => {
+            action_response("수동 실행", "Google Sheets 실행", open_google_sheets())
+        }
+        ("GET", "/create-gsheet") | ("POST", "/create-gsheet") => action_response(
+            "수동 실행",
+            "Google Sheets 생성 화면 실행",
+            open_google_sheets(),
+        ),
         ("POST", "/prompt") => prompt_response(form_value(&request.body, "prompt")),
         ("GET", "/prompt") => prompt_response(query_value(&request.path, "prompt")),
         _ => (
@@ -344,6 +346,23 @@ fn prompt_response(prompt: Option<String>) -> (&'static str, &'static str, Strin
                 result_html(
                     "OpenAI 프롬프트",
                     "Google Sheets 실행",
+                    &message,
+                    Some(prompt),
+                ),
+            ),
+            Err(err) => (
+                "500 Internal Server Error",
+                "text/html; charset=utf-8",
+                result_html("OpenAI 프롬프트", "실패", &err, Some(prompt)),
+            ),
+        },
+        Ok(PromptAction::CreateGoogleSheets) => match open_google_sheets() {
+            Ok(message) => (
+                "200 OK",
+                "text/html; charset=utf-8",
+                result_html(
+                    "OpenAI 프롬프트",
+                    "Google Sheets 생성 화면 실행",
                     &message,
                     Some(prompt),
                 ),
