@@ -3,9 +3,9 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::os::unix::fs::OpenOptionsExt;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,6 +21,7 @@ struct HttpRequest {
 enum PromptAction {
     OpenExcel,
     OpenCsv,
+    OpenGoogleSheets,
     Deny,
 }
 
@@ -88,7 +89,12 @@ where
         return Ok(());
     };
     let response = handler(request);
-    write_response(&mut stream, response.status, response.content_type, response.body.as_bytes())
+    write_response(
+        &mut stream,
+        response.status,
+        response.content_type,
+        response.body.as_bytes(),
+    )
 }
 
 fn agent_route(request: HttpRequest) -> Response {
@@ -122,6 +128,15 @@ fn agent_route(request: HttpRequest) -> Response {
                 Err(err) => text("500 Internal Server Error", &err),
             }
         }
+        ("POST", "/open-google-sheets") | ("GET", "/open-google-sheets") => {
+            if !authorized(&request) {
+                return text("401 Unauthorized", "unauthorized\n");
+            }
+            match open_google_sheets() {
+                Ok(msg) => text("200 OK", &format!("agent action=OPEN_GOOGLE_SHEETS\n{msg}")),
+                Err(err) => text("500 Internal Server Error", &err),
+            }
+        }
         _ => text("404 Not Found", "not found\n"),
     }
 }
@@ -143,7 +158,12 @@ fn gateway_route(request: HttpRequest, agent_url: &str) -> Response {
             match forward_to_agent(agent_url, prompt) {
                 Ok(agent_reply) => html(
                     "200 OK",
-                    &gateway_result("Vultr -> Tailscale -> 로컬 Excel", &agent_reply, agent_url, prompt),
+                    &gateway_result(
+                        "Vultr -> Tailscale -> 로컬 Excel",
+                        &agent_reply,
+                        agent_url,
+                        prompt,
+                    ),
                 ),
                 Err(err) => html(
                     "502 Bad Gateway",
@@ -176,6 +196,23 @@ fn gateway_route(request: HttpRequest, agent_url: &str) -> Response {
                 ),
             }
         }
+        ("POST", "/open-google-sheets") | ("GET", "/open-google-sheets") => {
+            match forward_to_agent_endpoint(agent_url, "open-google-sheets", "") {
+                Ok(agent_reply) => html(
+                    "200 OK",
+                    &gateway_result(
+                        "Vultr -> Tailscale -> Google Sheets",
+                        &agent_reply,
+                        agent_url,
+                        "",
+                    ),
+                ),
+                Err(err) => html(
+                    "502 Bad Gateway",
+                    &gateway_result("Google Sheets Agent 호출 실패", &err, agent_url, ""),
+                ),
+            }
+        }
         _ => text("404 Not Found", "not found\n"),
     }
 }
@@ -196,18 +233,33 @@ fn agent_execute_prompt(prompt: &str) -> Response {
             ),
             Err(err) => text("500 Internal Server Error", &err),
         },
+        Ok(PromptAction::OpenGoogleSheets) => match open_google_sheets() {
+            Ok(msg) => text(
+                "200 OK",
+                &format!("agent action=OPEN_GOOGLE_SHEETS\nprompt={prompt}\n{msg}"),
+            ),
+            Err(err) => text("500 Internal Server Error", &err),
+        },
         Ok(PromptAction::Deny) => text(
             "200 OK",
-            &format!("agent action=DENY\nprompt={prompt}\nExcel 실행 요청으로 판단하지 않았습니다.\n"),
+            &format!(
+                "agent action=DENY\nprompt={prompt}\nExcel 실행 요청으로 판단하지 않았습니다.\n"
+            ),
         ),
-        Err(err) => text("500 Internal Server Error", &format!("OpenAI API 실패: {err}\n")),
+        Err(err) => text(
+            "500 Internal Server Error",
+            &format!("OpenAI API 실패: {err}\n"),
+        ),
     }
 }
 
 fn agent_execute_prompt_computer_use(prompt: &str) -> Response {
     match run_computer_use_excel(prompt) {
         Ok(log) => text("200 OK", &log),
-        Err(err) => text("500 Internal Server Error", &format!("computer use 실패: {err}\n")),
+        Err(err) => text(
+            "500 Internal Server Error",
+            &format!("computer use 실패: {err}\n"),
+        ),
     }
 }
 
@@ -227,7 +279,11 @@ fn run_computer_use_excel(prompt: &str) -> Result<String, String> {
     let mut body = call_openai_computer_initial(&api_key, &task)?;
 
     for step in 1..=8 {
-        let Some(call_id) = jq_first_string(&body, ".output[]? | select(.type==\"computer_call\") | .call_id")? else {
+        let Some(call_id) = jq_first_string(
+            &body,
+            ".output[]? | select(.type==\"computer_call\") | .call_id",
+        )?
+        else {
             log.push_str(&format!("step={step} computer_call 없음, 종료\n"));
             return Ok(log);
         };
@@ -331,7 +387,10 @@ fn call_openai_json(api_key: &str, payload: &str) -> Result<String, String> {
         ));
     }
     let Some((body, status_text)) = stdout.rsplit_once("\n__HTTP_STATUS__:") else {
-        return Err(format!("OpenAI HTTP 상태를 읽지 못했습니다: {}", truncate(&stdout, 800)));
+        return Err(format!(
+            "OpenAI HTTP 상태를 읽지 못했습니다: {}",
+            truncate(&stdout, 800)
+        ));
     };
     let status = status_text.trim().parse::<u16>().unwrap_or(0);
     if !(200..300).contains(&status) {
@@ -342,7 +401,9 @@ fn call_openai_json(api_key: &str, payload: &str) -> Result<String, String> {
 
 fn jq_first_string(input: &str, filter: &str) -> Result<Option<String>, String> {
     let lines = jq_lines(input, filter)?;
-    Ok(lines.into_iter().find(|line| !line.trim().is_empty() && line.trim() != "null"))
+    Ok(lines
+        .into_iter()
+        .find(|line| !line.trim().is_empty() && line.trim() != "null"))
 }
 
 fn jq_lines(input: &str, filter: &str) -> Result<Vec<String>, String> {
@@ -417,8 +478,8 @@ fn execute_computer_action_lines(lines: &[String]) -> Result<(), String> {
 
 fn capture_windows_screenshot_base64() -> Result<String, String> {
     let path = demo_screenshot_path();
-    let win_path = wsl_to_windows_path(&path)
-        .ok_or_else(|| format!("Windows 경로 변환 실패: {path:?}"))?;
+    let win_path =
+        wsl_to_windows_path(&path).ok_or_else(|| format!("Windows 경로 변환 실패: {path:?}"))?;
     let ps = format!(
         "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
          $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
@@ -493,7 +554,9 @@ fn key_to_vk(key: &str) -> Option<u8> {
 fn type_text(text: &str) -> Result<(), String> {
     let safe: String = text
         .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '.' | '-' | '_' | ':' | '\\' | '/'))
+        .filter(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '.' | '-' | '_' | ':' | '\\' | '/')
+        })
         .collect();
     if safe.is_empty() {
         return Err("type action 텍스트가 비어 있거나 허용 문자가 아닙니다.".to_string());
@@ -534,7 +597,14 @@ fn excel_process_seen() -> bool {
 
 fn run_powershell_wait(command: &str) -> Result<(), String> {
     let output = Command::new(powershell_path())
-        .args(["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", command])
+        .args([
+            "-NoProfile",
+            "-STA",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
@@ -567,12 +637,20 @@ fn forward_to_agent(agent_url: &str, prompt: &str) -> Result<String, String> {
     forward_to_agent_endpoint(agent_url, "run", prompt)
 }
 
-fn forward_to_agent_endpoint(agent_url: &str, endpoint: &str, prompt: &str) -> Result<String, String> {
+fn forward_to_agent_endpoint(
+    agent_url: &str,
+    endpoint: &str,
+    prompt: &str,
+) -> Result<String, String> {
     let token = bridge_token();
     let run_url = format!("{}/{}", agent_url.trim_end_matches('/'), endpoint);
     let header = format!("X-Excel-Bridge-Token: {token}");
     let form = format!("prompt={}", url_encode(prompt));
-    let timeout = if endpoint == "run-computer" { "100" } else { "30" };
+    let timeout = if endpoint == "run-computer" {
+        "100"
+    } else {
+        "30"
+    };
     let form_path = write_secret_temp("excel-agent-form", ".txt", &form)?;
     let data_ref = format!("@{}", form_path.display());
     let config = format!(
@@ -613,8 +691,9 @@ fn classify_prompt_with_openai(prompt: &str) -> Result<PromptAction, String> {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "gpt-5.5".to_string());
     let instructions = "\
-한국어 명령 분류기. 한 단어만 출력: OPEN_EXCEL, OPEN_CSV, DENY. \
-엑셀 실행/열기/켜줘는 OPEN_EXCEL. CSV/표 데이터/샘플 CSV는 OPEN_CSV. 나머지는 DENY.";
+한국어 명령 분류기. 한 단어만 출력: OPEN_EXCEL, OPEN_CSV, OPEN_GOOGLE_SHEETS, DENY. \
+엑셀 실행/열기/켜줘는 OPEN_EXCEL. CSV/표 데이터/샘플 CSV는 OPEN_CSV. \
+구글 스프레드시트/구글시트/Google Sheets/웹 스프레드시트/웹엑셀은 OPEN_GOOGLE_SHEETS. 나머지는 DENY.";
     let input = format!("요청: {prompt}");
     let payload = format!(
         "{{\"model\":{},\"instructions\":{},\"input\":{},\"reasoning\":{{\"effort\":\"none\"}},\"max_output_tokens\":64,\"store\":false}}",
@@ -624,7 +703,9 @@ fn classify_prompt_with_openai(prompt: &str) -> Result<PromptAction, String> {
     );
     let body = call_openai_responses_api(&api_key, &payload)?;
     let decision_area = openai_output_area(&body);
-    if decision_area.contains("OPEN_CSV") {
+    if decision_area.contains("OPEN_GOOGLE_SHEETS") {
+        Ok(PromptAction::OpenGoogleSheets)
+    } else if decision_area.contains("OPEN_CSV") {
         Ok(PromptAction::OpenCsv)
     } else if decision_area.contains("OPEN_EXCEL") {
         Ok(PromptAction::OpenExcel)
@@ -669,7 +750,10 @@ fn call_openai_responses_api(api_key: &str, payload: &str) -> Result<String, Str
     }
 
     let Some((body, status_text)) = stdout.rsplit_once("\n__HTTP_STATUS__:") else {
-        return Err(format!("OpenAI HTTP 상태를 읽지 못했습니다: {}", truncate(&stdout, 800)));
+        return Err(format!(
+            "OpenAI HTTP 상태를 읽지 못했습니다: {}",
+            truncate(&stdout, 800)
+        ));
     };
     let status = status_text.trim().parse::<u16>().unwrap_or(0);
     if !(200..300).contains(&status) {
@@ -713,9 +797,32 @@ fn create_csv_and_open() -> Result<String, String> {
     ))
 }
 
+fn open_google_sheets() -> Result<String, String> {
+    let url = google_sheets_url();
+    let command = format!("Start-Process {}", powershell_single_quote(&url));
+    spawn_powershell(&command)?;
+    Ok(format!(
+        "Google Sheets 새 스프레드시트 실행 요청을 보냈습니다.\nURL: {url}\n기존 브라우저의 Google 로그인 세션을 사용합니다.\n"
+    ))
+}
+
+fn google_sheets_url() -> String {
+    env::var("GOOGLE_SHEETS_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://docs.google.com/spreadsheets/create".to_string())
+}
+
 fn spawn_powershell(command: &str) -> Result<(), String> {
     Command::new(powershell_path())
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command])
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -731,7 +838,7 @@ fn gateway_index(agent_url: &str) -> String {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Vultr Tailscale Excel Gateway</title>
+  <title>Vultr Tailscale Spreadsheet Gateway</title>
   <style>
     body {{ margin: 0; font-family: system-ui, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; color: #111827; background: #f5f7fb; }}
     main {{ width: min(880px, calc(100vw - 32px)); margin: 48px auto; background: #fff; border: 1px solid #d7dde8; border-radius: 8px; padding: 28px; box-shadow: 0 16px 36px rgba(31, 41, 55, .08); }}
@@ -745,10 +852,10 @@ fn gateway_index(agent_url: &str) -> String {
 </head>
 <body>
   <main>
-    <h1>Vultr에서 Tailscale로 로컬 Excel 실행</h1>
+    <h1>Vultr에서 Tailscale로 Excel / Google Sheets 실행</h1>
     <p>
       이 화면은 Vultr 노드의 gateway가 제공합니다. 버튼을 누르면 Vultr가 Tailscale 주소
-      <code>{agent_url}</code>의 WSL local agent에 요청하고, local agent가 Windows Excel을 실행합니다.
+      <code>{agent_url}</code>의 WSL local agent에 요청하고, local agent가 allowlist된 Excel 또는 Google Sheets 액션을 실행합니다.
     </p>
     <form method="post" action="/prompt">
       <label for="prompt">한글 프롬프트</label>
@@ -758,6 +865,9 @@ fn gateway_index(agent_url: &str) -> String {
     <form method="post" action="/prompt-computer">
       <input name="prompt" value="엑셀 실행해줘" type="hidden">
       <p><button type="submit">OpenAI Computer Use로 Excel 실행</button></p>
+    </form>
+    <form method="post" action="/open-google-sheets">
+      <p><button type="submit">Google Sheets 새 스프레드시트 열기</button></p>
     </form>
   </main>
 </body>
@@ -771,7 +881,10 @@ fn gateway_result(title: &str, message: &str, agent_url: &str, prompt: &str) -> 
     let prompt_line = if prompt.is_empty() {
         String::new()
     } else {
-        format!("<p><strong>프롬프트:</strong> <code>{}</code></p>", html_escape(prompt))
+        format!(
+            "<p><strong>프롬프트:</strong> <code>{}</code></p>",
+            html_escape(prompt)
+        )
     };
     format!(
         r#"<!doctype html>
@@ -793,7 +906,7 @@ fn gateway_result(title: &str, message: &str, agent_url: &str, prompt: &str) -> 
 <body>
   <main>
     <h1>{title}</h1>
-    <p><strong>경로:</strong> Vultr gateway -> Tailscale -> WSL local agent -> Windows Excel</p>
+    <p><strong>경로:</strong> Vultr gateway -> Tailscale -> WSL local agent -> allowlist action</p>
     <p><strong>Agent:</strong> <code>{agent_url}</code></p>
     {prompt_line}
     <pre>{message}</pre>
@@ -1032,7 +1145,8 @@ fn url_decode(value: &str) -> String {
                 i += 1;
             }
             b'%' if i + 2 < bytes.len() => {
-                if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+                {
                     out.push((high << 4) | low);
                     i += 3;
                 } else {

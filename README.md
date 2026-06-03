@@ -6,8 +6,9 @@
 
 1. 로컬 웹앱이 로컬 Windows Excel을 실행할 수 있다.
 2. 리모트 Vultr 서버가 Tailscale을 통해 로컬 PC의 Excel 실행 agent를 호출할 수 있다.
+3. 같은 allowlist 구조로 Google Sheets 새 스프레드시트도 브라우저의 기존 Google 로그인 세션에서 열 수 있다.
 
-브라우저가 직접 로컬 프로그램을 실행하는 방식이 아닙니다. 브라우저는 HTTP 요청만 보내고, Rust 서버 또는 local agent가 allowlist된 실행 작업을 수행합니다. ActiveX는 사용하지 않습니다.
+브라우저가 직접 로컬 프로그램을 실행하는 방식이 아닙니다. 브라우저는 HTTP 요청만 보내고, Rust 서버 또는 local agent가 allowlist된 실행 작업을 수행합니다. ActiveX는 사용하지 않습니다. Google Sheets 실행은 로컬 프로그램 의존이 아니라 기본 브라우저의 인증된 Google 세션으로 `https://docs.google.com/spreadsheets/create`를 여는 웹 스프레드시트 경로입니다.
 
 ## Architecture
 
@@ -54,6 +55,7 @@ Browser
 ```text
 엑셀 실행해줘 -> OPEN_EXCEL
 샘플 CSV 만들어서 엑셀로 열어줘 -> OPEN_CSV
+구글 스프레드시트 열어줘 -> OPEN_GOOGLE_SHEETS
 기타 요청 -> DENY
 ```
 
@@ -136,7 +138,10 @@ Local-only endpoints:
 - `GET /health`
 - `GET /open-excel`
 - `GET /open-csv`
+- `GET /open-google-sheets`
 - `POST /prompt`
+
+Google Sheets URL은 기본값으로 `https://docs.google.com/spreadsheets/create`를 사용합니다. 특정 문서나 Google Workspace 경로를 열고 싶으면 실행 환경에서 `GOOGLE_SHEETS_URL`을 지정하십시오.
 
 ## Vultr + Tailscale Build
 
@@ -201,6 +206,7 @@ Gateway endpoints:
 
 - `POST /prompt`
 - `POST /prompt-computer`
+- `POST /open-google-sheets`
 
 ## Systemd User Services
 
@@ -241,6 +247,21 @@ curl -X POST http://100.y.y.y:8878/prompt \
 agent action=OPEN_EXCEL
 prompt=엑셀 실행해줘
 로컬 Windows Excel 실행 요청을 보냈습니다.
+```
+
+Google Sheets mode:
+
+```bash
+curl -X POST http://100.y.y.y:8878/open-google-sheets
+```
+
+성공 로그 예:
+
+```text
+agent action=OPEN_GOOGLE_SHEETS
+Google Sheets 새 스프레드시트 실행 요청을 보냈습니다.
+URL: https://docs.google.com/spreadsheets/create
+기존 브라우저의 Google 로그인 세션을 사용합니다.
 ```
 
 Computer Use mode:

@@ -18,6 +18,8 @@ struct HttpRequest {
 enum PromptAction {
     OpenExcel,
     OpenCsv,
+    OpenGoogleSheets,
+    CreateGoogleSheets,
     Deny,
 }
 
@@ -54,7 +56,15 @@ fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
         ("GET", "/") => ("200 OK", "text/html; charset=utf-8", index_html()),
         ("GET", "/health") => ("200 OK", "text/plain; charset=utf-8", "ok\n".to_string()),
         ("GET", "/open-excel") => action_response("수동 실행", "엑셀 실행", open_blank_excel()),
-        ("GET", "/open-csv") => action_response("수동 실행", "CSV 생성 후 엑셀 실행", create_csv_and_open()),
+        ("GET", "/open-csv") => {
+            action_response("수동 실행", "CSV 생성 후 엑셀 실행", create_csv_and_open())
+        }
+        // Real web spreadsheet: 302 the requester's browser straight to Google Sheets.
+        // Uses that browser's existing leinhard@gmail.com login. No local program launch.
+        ("GET", "/open-google-sheets") => ("302 Found", "", google_sheets_new_url()),
+        // Server-side proof of Google auth: create a real sheet in Drive via Sheets API,
+        // write sample rows, then redirect to its live cloud URL.
+        ("GET", "/create-gsheet") | ("POST", "/create-gsheet") => create_gsheet_response(),
         ("POST", "/prompt") => prompt_response(form_value(&request.body, "prompt")),
         ("GET", "/prompt") => prompt_response(query_value(&request.path, "prompt")),
         _ => (
@@ -131,6 +141,17 @@ fn write_response(
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
+    // Redirect convention: status "302 Found" carries the Location URL in `body`.
+    // Lets the requester's own browser navigate to a real web spreadsheet
+    // (no local Start-Process), so it also works over the remote/Tailscale path.
+    if status.starts_with("302") {
+        let location = String::from_utf8_lossy(body);
+        write!(
+            stream,
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )?;
+        return Ok(());
+    }
     write!(
         stream,
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -227,6 +248,7 @@ fn index_html() -> String {
       아래 입력창에 <code>엑셀 실행해줘</code>처럼 한글로 요청하면,
       Rust 서버가 OpenAI API 모델 <code>{model}</code>로 명령을 판별한 뒤
       이 PC의 Windows Excel을 실행합니다. ActiveX는 사용하지 않습니다.
+      Google Sheets 요청은 브라우저의 기존 Google 로그인 세션으로 새 스프레드시트를 엽니다.
     </p>
 
     <form method="post" action="/prompt">
@@ -236,6 +258,7 @@ fn index_html() -> String {
         <button type="submit">GPT로 판단해서 실행</button>
         <a class="button secondary" href="/open-excel">API 없이 바로 Excel 실행</a>
         <a class="button secondary" href="/open-csv">샘플 CSV를 Excel로 열기</a>
+        <a class="button secondary" href="/open-google-sheets">Google Sheets 열기</a>
       </div>
     </form>
 
@@ -249,7 +272,11 @@ fn index_html() -> String {
     )
 }
 
-fn action_response(source: &str, action: &str, result: Result<String, String>) -> (&'static str, &'static str, String) {
+fn action_response(
+    source: &str,
+    action: &str,
+    result: Result<String, String>,
+) -> (&'static str, &'static str, String) {
     match result {
         Ok(message) => (
             "200 OK",
@@ -271,7 +298,12 @@ fn prompt_response(prompt: Option<String>) -> (&'static str, &'static str, Strin
         return (
             "400 Bad Request",
             "text/html; charset=utf-8",
-            result_html("OpenAI 프롬프트", "실패", "프롬프트가 비어 있습니다.", Some(prompt)),
+            result_html(
+                "OpenAI 프롬프트",
+                "실패",
+                "프롬프트가 비어 있습니다.",
+                Some(prompt),
+            ),
         );
     }
 
@@ -292,7 +324,29 @@ fn prompt_response(prompt: Option<String>) -> (&'static str, &'static str, Strin
             Ok(message) => (
                 "200 OK",
                 "text/html; charset=utf-8",
-                result_html("OpenAI 프롬프트", "CSV 생성 후 엑셀 실행", &message, Some(prompt)),
+                result_html(
+                    "OpenAI 프롬프트",
+                    "CSV 생성 후 엑셀 실행",
+                    &message,
+                    Some(prompt),
+                ),
+            ),
+            Err(err) => (
+                "500 Internal Server Error",
+                "text/html; charset=utf-8",
+                result_html("OpenAI 프롬프트", "실패", &err, Some(prompt)),
+            ),
+        },
+        Ok(PromptAction::OpenGoogleSheets) => match open_google_sheets() {
+            Ok(message) => (
+                "200 OK",
+                "text/html; charset=utf-8",
+                result_html(
+                    "OpenAI 프롬프트",
+                    "Google Sheets 실행",
+                    &message,
+                    Some(prompt),
+                ),
             ),
             Err(err) => (
                 "500 Internal Server Error",
@@ -320,7 +374,12 @@ fn prompt_response(prompt: Option<String>) -> (&'static str, &'static str, Strin
 
 fn result_html(source: &str, action: &str, message: &str, prompt: Option<&str>) -> String {
     let prompt_line = prompt
-        .map(|p| format!("<p><strong>입력:</strong> <code>{}</code></p>", html_escape(p)))
+        .map(|p| {
+            format!(
+                "<p><strong>입력:</strong> <code>{}</code></p>",
+                html_escape(p)
+            )
+        })
         .unwrap_or_default();
     format!(
         r#"<!doctype html>
@@ -394,8 +453,10 @@ fn classify_prompt_with_openai(prompt: &str) -> Result<PromptAction, String> {
     let model = openai_model();
 
     let instructions = "\
-한국어 명령 분류기. 한 단어만 출력: OPEN_EXCEL, OPEN_CSV, DENY. \
-엑셀 실행/열기/켜줘는 OPEN_EXCEL. CSV/표 데이터/샘플 CSV는 OPEN_CSV. 나머지는 DENY.";
+한국어 명령 분류기. 한 단어만 출력: OPEN_EXCEL, OPEN_CSV, OPEN_GOOGLE_SHEETS, CREATE_GOOGLE_SHEETS, DENY. \
+엑셀 실행/열기/켜줘는 OPEN_EXCEL. CSV/표 데이터/샘플 CSV는 OPEN_CSV. \
+구글 스프레드시트/구글시트/Google Sheets/웹 스프레드시트/웹엑셀을 열기/실행/켜기는 OPEN_GOOGLE_SHEETS. \
+구글 시트를 새로 만들기/생성/샘플 데이터 채워서 만들기는 CREATE_GOOGLE_SHEETS. 나머지는 DENY.";
     let input = format!("요청: {prompt}");
     let payload = format!(
         "{{\"model\":{},\"instructions\":{},\"input\":{},\"reasoning\":{{\"effort\":\"none\"}},\"max_output_tokens\":64,\"store\":false}}",
@@ -406,7 +467,11 @@ fn classify_prompt_with_openai(prompt: &str) -> Result<PromptAction, String> {
 
     let body = call_openai_responses_api(&api_key, &payload)?;
     let decision_area = openai_output_area(&body);
-    if decision_area.contains("OPEN_CSV") {
+    if decision_area.contains("CREATE_GOOGLE_SHEETS") {
+        Ok(PromptAction::CreateGoogleSheets)
+    } else if decision_area.contains("OPEN_GOOGLE_SHEETS") {
+        Ok(PromptAction::OpenGoogleSheets)
+    } else if decision_area.contains("OPEN_CSV") {
         Ok(PromptAction::OpenCsv)
     } else if decision_area.contains("OPEN_EXCEL") {
         Ok(PromptAction::OpenExcel)
@@ -464,14 +529,14 @@ fn call_openai_responses_api(api_key: &str, payload: &str) -> Result<String, Str
     }
 
     let Some((body, status_text)) = stdout.rsplit_once("\n__HTTP_STATUS__:") else {
-        return Err(format!("OpenAI HTTP 상태를 읽지 못했습니다: {}", truncate(&stdout, 800)));
+        return Err(format!(
+            "OpenAI HTTP 상태를 읽지 못했습니다: {}",
+            truncate(&stdout, 800)
+        ));
     };
     let status = status_text.trim().parse::<u16>().unwrap_or(0);
     if !(200..300).contains(&status) {
-        return Err(format!(
-            "OpenAI HTTP {status}: {}",
-            truncate(body, 1200)
-        ));
+        return Err(format!("OpenAI HTTP {status}: {}", truncate(body, 1200)));
     }
 
     Ok(body.to_string())
@@ -521,6 +586,23 @@ fn create_csv_and_open() -> Result<String, String> {
     ))
 }
 
+fn open_google_sheets() -> Result<String, String> {
+    let url = google_sheets_url();
+    let command = format!("Start-Process {}", powershell_single_quote(&url));
+    spawn_powershell(&command)?;
+    Ok(format!(
+        "Google Sheets 새 스프레드시트 실행 요청을 보냈습니다.\nURL: {url}\n기존 브라우저의 Google 로그인 세션을 사용합니다.\n"
+    ))
+}
+
+fn google_sheets_url() -> String {
+    env::var("GOOGLE_SHEETS_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://docs.google.com/spreadsheets/create".to_string())
+}
+
 fn demo_csv_path() -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -555,7 +637,13 @@ fn powershell_single_quote(value: &str) -> String {
 
 fn spawn_powershell(command: &str) -> Result<(), String> {
     Command::new(powershell_path())
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command])
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -609,7 +697,8 @@ fn url_decode(value: &str) -> String {
                 i += 1;
             }
             b'%' if i + 2 < bytes.len() => {
-                if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+                {
                     out.push((high << 4) | low);
                     i += 3;
                 } else {
