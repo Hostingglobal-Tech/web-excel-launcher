@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const SAMPLE_WORKBOOK: &[u8] = include_bytes!("../assets/sample-web-excel-launcher.xlsx");
+
 #[derive(Debug)]
 struct HttpRequest {
     method: String,
@@ -22,6 +24,8 @@ enum PromptAction {
     OpenExcel,
     OpenCsv,
     OpenGoogleSheets,
+    OpenMicrosoftExcelWeb,
+    OpenMicrosoftOfficeViewer,
     Deny,
 }
 
@@ -93,7 +97,7 @@ where
         &mut stream,
         response.status,
         response.content_type,
-        response.body.as_bytes(),
+        &response.body,
     )
 }
 
@@ -137,6 +141,32 @@ fn agent_route(request: HttpRequest) -> Response {
                 Err(err) => text("500 Internal Server Error", &err),
             }
         }
+        ("POST", "/open-ms-excel-web") | ("GET", "/open-ms-excel-web") => {
+            if !authorized(&request) {
+                return text("401 Unauthorized", "unauthorized\n");
+            }
+            match open_microsoft_excel_web() {
+                Ok(msg) => text(
+                    "200 OK",
+                    &format!("agent action=OPEN_MICROSOFT_EXCEL_WEB\n{msg}"),
+                ),
+                Err(err) => text("500 Internal Server Error", &err),
+            }
+        }
+        ("POST", "/open-ms-office-viewer") | ("GET", "/open-ms-office-viewer") => {
+            if !authorized(&request) {
+                return text("401 Unauthorized", "unauthorized\n");
+            }
+            let src =
+                form_value(&request.body, "src").or_else(|| query_value(&request.path, "src"));
+            match open_microsoft_office_viewer(src.as_deref()) {
+                Ok(msg) => text(
+                    "200 OK",
+                    &format!("agent action=OPEN_MICROSOFT_OFFICE_VIEWER\n{msg}"),
+                ),
+                Err(err) => text("500 Internal Server Error", &err),
+            }
+        }
         _ => text("404 Not Found", "not found\n"),
     }
 }
@@ -146,6 +176,11 @@ fn gateway_route(request: HttpRequest, agent_url: &str) -> Response {
     match (request.method.as_str(), route) {
         ("GET", "/") => html("200 OK", &gateway_index(agent_url)),
         ("GET", "/health") => text("200 OK", "gateway ok\n"),
+        ("GET", "/sample.xlsx") => binary(
+            "200 OK",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            SAMPLE_WORKBOOK.to_vec(),
+        ),
         ("POST", "/prompt") => {
             let prompt = form_value(&request.body, "prompt").unwrap_or_default();
             let prompt = prompt.trim();
@@ -213,6 +248,52 @@ fn gateway_route(request: HttpRequest, agent_url: &str) -> Response {
                 ),
             }
         }
+        ("POST", "/open-ms-excel-web") | ("GET", "/open-ms-excel-web") => {
+            match forward_to_agent_endpoint(agent_url, "open-ms-excel-web", "") {
+                Ok(agent_reply) => html(
+                    "200 OK",
+                    &gateway_result(
+                        "Vultr -> Tailscale -> Microsoft Excel for the web",
+                        &agent_reply,
+                        agent_url,
+                        "",
+                    ),
+                ),
+                Err(err) => html(
+                    "502 Bad Gateway",
+                    &gateway_result("Microsoft Excel Web Agent 호출 실패", &err, agent_url, ""),
+                ),
+            }
+        }
+        ("POST", "/open-ms-office-viewer") | ("GET", "/open-ms-office-viewer") => {
+            let src = form_value(&request.body, "src")
+                .or_else(|| query_value(&request.path, "src"))
+                .unwrap_or_else(|| gateway_sample_workbook_url(&request));
+            match forward_to_agent_endpoint_with_fields(
+                agent_url,
+                "open-ms-office-viewer",
+                &[("src", src.as_str())],
+            ) {
+                Ok(agent_reply) => html(
+                    "200 OK",
+                    &gateway_result(
+                        "Vultr -> Tailscale -> Microsoft Office Web Viewer",
+                        &agent_reply,
+                        agent_url,
+                        "",
+                    ),
+                ),
+                Err(err) => html(
+                    "502 Bad Gateway",
+                    &gateway_result(
+                        "Microsoft Office Web Viewer Agent 호출 실패",
+                        &err,
+                        agent_url,
+                        "",
+                    ),
+                ),
+            }
+        }
         _ => text("404 Not Found", "not found\n"),
     }
 }
@@ -237,6 +318,20 @@ fn agent_execute_prompt(prompt: &str) -> Response {
             Ok(msg) => text(
                 "200 OK",
                 &format!("agent action=OPEN_GOOGLE_SHEETS\nprompt={prompt}\n{msg}"),
+            ),
+            Err(err) => text("500 Internal Server Error", &err),
+        },
+        Ok(PromptAction::OpenMicrosoftExcelWeb) => match open_microsoft_excel_web() {
+            Ok(msg) => text(
+                "200 OK",
+                &format!("agent action=OPEN_MICROSOFT_EXCEL_WEB\nprompt={prompt}\n{msg}"),
+            ),
+            Err(err) => text("500 Internal Server Error", &err),
+        },
+        Ok(PromptAction::OpenMicrosoftOfficeViewer) => match open_microsoft_office_viewer(None) {
+            Ok(msg) => text(
+                "200 OK",
+                &format!("agent action=OPEN_MICROSOFT_OFFICE_VIEWER\nprompt={prompt}\n{msg}"),
             ),
             Err(err) => text("500 Internal Server Error", &err),
         },
@@ -642,10 +737,22 @@ fn forward_to_agent_endpoint(
     endpoint: &str,
     prompt: &str,
 ) -> Result<String, String> {
+    forward_to_agent_endpoint_with_fields(agent_url, endpoint, &[("prompt", prompt)])
+}
+
+fn forward_to_agent_endpoint_with_fields(
+    agent_url: &str,
+    endpoint: &str,
+    fields: &[(&str, &str)],
+) -> Result<String, String> {
     let token = bridge_token();
     let run_url = format!("{}/{}", agent_url.trim_end_matches('/'), endpoint);
     let header = format!("X-Excel-Bridge-Token: {token}");
-    let form = format!("prompt={}", url_encode(prompt));
+    let form = fields
+        .iter()
+        .map(|(key, value)| format!("{}={}", url_encode(key), url_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
     let timeout = if endpoint == "run-computer" {
         "100"
     } else {
@@ -683,6 +790,22 @@ fn forward_to_agent_endpoint(
     }
 }
 
+fn gateway_sample_workbook_url(request: &HttpRequest) -> String {
+    env::var("EXCEL_GATEWAY_PUBLIC_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            let host = request
+                .headers
+                .get("host")
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:8878".to_string());
+            format!("http://{host}")
+        })
+        + "/sample.xlsx"
+}
+
 fn classify_prompt_with_openai(prompt: &str) -> Result<PromptAction, String> {
     let api_key = env::var("OPENAI_API_KEY")
         .map_err(|_| "OPENAI_API_KEY 환경변수가 로컬 agent에 없습니다.".to_string())?;
@@ -691,9 +814,11 @@ fn classify_prompt_with_openai(prompt: &str) -> Result<PromptAction, String> {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "gpt-5.5".to_string());
     let instructions = "\
-한국어 명령 분류기. 한 단어만 출력: OPEN_EXCEL, OPEN_CSV, OPEN_GOOGLE_SHEETS, DENY. \
+한국어 명령 분류기. 한 단어만 출력: OPEN_EXCEL, OPEN_CSV, OPEN_GOOGLE_SHEETS, OPEN_MICROSOFT_EXCEL_WEB, OPEN_MICROSOFT_OFFICE_VIEWER, DENY. \
 엑셀 실행/열기/켜줘는 OPEN_EXCEL. CSV/표 데이터/샘플 CSV는 OPEN_CSV. \
-구글 스프레드시트/구글시트/Google Sheets/웹 스프레드시트/웹엑셀은 OPEN_GOOGLE_SHEETS. 나머지는 DENY.";
+구글 스프레드시트/구글시트/Google Sheets는 OPEN_GOOGLE_SHEETS. \
+마이크로소프트 웹용 엑셀/Excel for the web/Microsoft 365 Excel/웹 엑셀은 OPEN_MICROSOFT_EXCEL_WEB. \
+MS Office Web Viewer/Office Web Viewer/엑셀 웹 뷰어/웹용 엑셀 뷰어/뷰어로 보기 요청은 OPEN_MICROSOFT_OFFICE_VIEWER. 나머지는 DENY.";
     let input = format!("요청: {prompt}");
     let payload = format!(
         "{{\"model\":{},\"instructions\":{},\"input\":{},\"reasoning\":{{\"effort\":\"none\"}},\"max_output_tokens\":64,\"store\":false}}",
@@ -703,7 +828,11 @@ fn classify_prompt_with_openai(prompt: &str) -> Result<PromptAction, String> {
     );
     let body = call_openai_responses_api(&api_key, &payload)?;
     let decision_area = openai_output_area(&body);
-    if decision_area.contains("OPEN_GOOGLE_SHEETS") {
+    if decision_area.contains("OPEN_MICROSOFT_OFFICE_VIEWER") {
+        Ok(PromptAction::OpenMicrosoftOfficeViewer)
+    } else if decision_area.contains("OPEN_MICROSOFT_EXCEL_WEB") {
+        Ok(PromptAction::OpenMicrosoftExcelWeb)
+    } else if decision_area.contains("OPEN_GOOGLE_SHEETS") {
         Ok(PromptAction::OpenGoogleSheets)
     } else if decision_area.contains("OPEN_CSV") {
         Ok(PromptAction::OpenCsv)
@@ -814,6 +943,59 @@ fn google_sheets_url() -> String {
         .unwrap_or_else(|| "https://docs.google.com/spreadsheets/create".to_string())
 }
 
+fn open_microsoft_excel_web() -> Result<String, String> {
+    let url = microsoft_excel_web_url();
+    open_browser_url(&url)?;
+    Ok(format!(
+        "Microsoft Excel for the web 실행 요청을 보냈습니다.\nURL: {url}\n브라우저의 기존 Microsoft 365 로그인 세션을 사용합니다.\n"
+    ))
+}
+
+fn open_microsoft_office_viewer(explicit_src: Option<&str>) -> Result<String, String> {
+    let src = office_viewer_source_url(explicit_src)?;
+    let url = microsoft_office_viewer_url(&src);
+    open_browser_url(&url)?;
+    Ok(format!(
+        "Microsoft Office Web Viewer 실행 요청을 보냈습니다.\nWorkbook: {src}\nViewer: {url}\n"
+    ))
+}
+
+fn open_browser_url(url: &str) -> Result<(), String> {
+    let command = format!("Start-Process {}", powershell_single_quote(url));
+    spawn_powershell(&command)
+}
+
+fn microsoft_excel_web_url() -> String {
+    env::var("MS_EXCEL_WEB_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://www.microsoft365.com/launch/excel?auth=1".to_string())
+}
+
+fn office_viewer_source_url(explicit_src: Option<&str>) -> Result<String, String> {
+    if let Some(value) = explicit_src
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(value.to_string());
+    }
+    env::var("MS_OFFICE_VIEWER_SRC_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "MS_OFFICE_VIEWER_SRC_URL 또는 src 파라미터가 필요합니다. Office Web Viewer는 Microsoft 서버가 접근 가능한 공개 .xlsx URL만 볼 수 있습니다.".to_string()
+        })
+}
+
+fn microsoft_office_viewer_url(src: &str) -> String {
+    format!(
+        "https://view.officeapps.live.com/op/view.aspx?src={}",
+        url_encode(src)
+    )
+}
+
 fn spawn_powershell(command: &str) -> Result<(), String> {
     Command::new(powershell_path())
         .args([
@@ -832,6 +1014,11 @@ fn spawn_powershell(command: &str) -> Result<(), String> {
 }
 
 fn gateway_index(agent_url: &str) -> String {
+    let prompt_path = gateway_path("/prompt");
+    let prompt_computer_path = gateway_path("/prompt-computer");
+    let google_sheets_path = gateway_path("/open-google-sheets");
+    let ms_excel_web_path = gateway_path("/open-ms-excel-web");
+    let ms_office_viewer_path = gateway_path("/open-ms-office-viewer");
     format!(
         r#"<!doctype html>
 <html lang="ko">
@@ -857,27 +1044,39 @@ fn gateway_index(agent_url: &str) -> String {
       이 화면은 Vultr 노드의 gateway가 제공합니다. 버튼을 누르면 Vultr가 Tailscale 주소
       <code>{agent_url}</code>의 WSL local agent에 요청하고, local agent가 allowlist된 Excel 또는 Google Sheets 액션을 실행합니다.
     </p>
-    <form method="post" action="/prompt">
+    <form method="post" action="{prompt_path}">
       <label for="prompt">한글 프롬프트</label>
       <input id="prompt" name="prompt" value="엑셀 실행해줘" autocomplete="off">
       <p><button type="submit">Vultr에서 로컬 PC Excel 실행</button></p>
     </form>
-    <form method="post" action="/prompt-computer">
+    <form method="post" action="{prompt_computer_path}">
       <input name="prompt" value="엑셀 실행해줘" type="hidden">
       <p><button type="submit">OpenAI Computer Use로 Excel 실행</button></p>
     </form>
-    <form method="post" action="/open-google-sheets">
+    <form method="post" action="{google_sheets_path}">
       <p><button type="submit">Google Sheets 새 스프레드시트 열기</button></p>
+    </form>
+    <form method="post" action="{ms_excel_web_path}">
+      <p><button type="submit">Microsoft Excel for the web 열기</button></p>
+    </form>
+    <form method="post" action="{ms_office_viewer_path}">
+      <p><button type="submit">Microsoft Office Web Viewer로 샘플 .xlsx 보기</button></p>
     </form>
   </main>
 </body>
 </html>
 "#,
-        agent_url = html_escape(agent_url)
+        agent_url = html_escape(agent_url),
+        prompt_path = html_escape(&prompt_path),
+        prompt_computer_path = html_escape(&prompt_computer_path),
+        google_sheets_path = html_escape(&google_sheets_path),
+        ms_excel_web_path = html_escape(&ms_excel_web_path),
+        ms_office_viewer_path = html_escape(&ms_office_viewer_path)
     )
 }
 
 fn gateway_result(title: &str, message: &str, agent_url: &str, prompt: &str) -> String {
+    let home_path = gateway_path("/");
     let prompt_line = if prompt.is_empty() {
         String::new()
     } else {
@@ -910,13 +1109,14 @@ fn gateway_result(title: &str, message: &str, agent_url: &str, prompt: &str) -> 
     <p><strong>Agent:</strong> <code>{agent_url}</code></p>
     {prompt_line}
     <pre>{message}</pre>
-    <a href="/">돌아가기</a>
+    <a href="{home_path}">돌아가기</a>
   </main>
 </body>
 </html>
 "#,
         title = html_escape(title),
         agent_url = html_escape(agent_url),
+        home_path = html_escape(&home_path),
         prompt_line = prompt_line,
         message = html_escape(message)
     )
@@ -926,14 +1126,14 @@ fn gateway_result(title: &str, message: &str, agent_url: &str, prompt: &str) -> 
 struct Response {
     status: &'static str,
     content_type: &'static str,
-    body: String,
+    body: Vec<u8>,
 }
 
 fn text(status: &'static str, body: &str) -> Response {
     Response {
         status,
         content_type: "text/plain; charset=utf-8",
-        body: body.to_string(),
+        body: body.as_bytes().to_vec(),
     }
 }
 
@@ -941,7 +1141,15 @@ fn html(status: &'static str, body: &str) -> Response {
     Response {
         status,
         content_type: "text/html; charset=utf-8",
-        body: body.to_string(),
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+fn binary(status: &'static str, content_type: &'static str, body: Vec<u8>) -> Response {
+    Response {
+        status,
+        content_type,
+        body,
     }
 }
 
@@ -1057,7 +1265,48 @@ fn bridge_token() -> String {
 }
 
 fn clean_route(path: &str) -> &str {
-    path.split('?').next().unwrap_or("/")
+    let route = path.split('?').next().unwrap_or("/");
+    let prefix = gateway_path_prefix();
+    if prefix.is_empty() {
+        return route;
+    }
+    if route == prefix {
+        return "/";
+    }
+    if route.starts_with(&prefix) && route.as_bytes().get(prefix.len()) == Some(&b'/') {
+        return &route[prefix.len()..];
+    }
+    route
+}
+
+fn gateway_path(path: &str) -> String {
+    let prefix = gateway_path_prefix();
+    if prefix.is_empty() {
+        return path.to_string();
+    }
+    if path == "/" {
+        prefix
+    } else {
+        format!("{prefix}{path}")
+    }
+}
+
+fn gateway_path_prefix() -> String {
+    env::var("EXCEL_GATEWAY_PATH_PREFIX")
+        .ok()
+        .map(|value| {
+            let trimmed = value.trim().trim_end_matches('/').to_string();
+            if trimmed == "/" {
+                String::new()
+            } else if trimmed.starts_with('/') {
+                trimmed
+            } else if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!("/{trimmed}")
+            }
+        })
+        .unwrap_or_default()
 }
 
 fn default_agent_bind() -> String {

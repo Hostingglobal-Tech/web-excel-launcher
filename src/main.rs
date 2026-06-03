@@ -20,6 +20,8 @@ enum PromptAction {
     OpenCsv,
     OpenGoogleSheets,
     CreateGoogleSheets,
+    OpenMicrosoftExcelWeb,
+    OpenMicrosoftOfficeViewer,
     Deny,
 }
 
@@ -66,6 +68,16 @@ fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
             "수동 실행",
             "Google Sheets 생성 화면 실행",
             open_google_sheets(),
+        ),
+        ("GET", "/open-ms-excel-web") => action_response(
+            "수동 실행",
+            "Microsoft Excel for the web 실행",
+            open_microsoft_excel_web(),
+        ),
+        ("GET", "/open-ms-office-viewer") => action_response(
+            "수동 실행",
+            "Microsoft Office Web Viewer 실행",
+            open_microsoft_office_viewer(query_value(&request.path, "src").as_deref()),
         ),
         ("POST", "/prompt") => prompt_response(form_value(&request.body, "prompt")),
         ("GET", "/prompt") => prompt_response(query_value(&request.path, "prompt")),
@@ -251,6 +263,7 @@ fn index_html() -> String {
       Rust 서버가 OpenAI API 모델 <code>{model}</code>로 명령을 판별한 뒤
       이 PC의 Windows Excel을 실행합니다. ActiveX는 사용하지 않습니다.
       Google Sheets 요청은 브라우저의 기존 Google 로그인 세션으로 새 스프레드시트를 엽니다.
+      Microsoft 웹 Excel과 Office Web Viewer도 별도 버튼으로 실행할 수 있습니다.
     </p>
 
     <form method="post" action="/prompt">
@@ -261,6 +274,8 @@ fn index_html() -> String {
         <a class="button secondary" href="/open-excel">API 없이 바로 Excel 실행</a>
         <a class="button secondary" href="/open-csv">샘플 CSV를 Excel로 열기</a>
         <a class="button secondary" href="/open-google-sheets">Google Sheets 열기</a>
+        <a class="button secondary" href="/open-ms-excel-web">MS Excel Web 열기</a>
+        <a class="button secondary" href="/open-ms-office-viewer">MS Office Viewer 열기</a>
       </div>
     </form>
 
@@ -373,6 +388,40 @@ fn prompt_response(prompt: Option<String>) -> (&'static str, &'static str, Strin
                 result_html("OpenAI 프롬프트", "실패", &err, Some(prompt)),
             ),
         },
+        Ok(PromptAction::OpenMicrosoftExcelWeb) => match open_microsoft_excel_web() {
+            Ok(message) => (
+                "200 OK",
+                "text/html; charset=utf-8",
+                result_html(
+                    "OpenAI 프롬프트",
+                    "Microsoft Excel for the web 실행",
+                    &message,
+                    Some(prompt),
+                ),
+            ),
+            Err(err) => (
+                "500 Internal Server Error",
+                "text/html; charset=utf-8",
+                result_html("OpenAI 프롬프트", "실패", &err, Some(prompt)),
+            ),
+        },
+        Ok(PromptAction::OpenMicrosoftOfficeViewer) => match open_microsoft_office_viewer(None) {
+            Ok(message) => (
+                "200 OK",
+                "text/html; charset=utf-8",
+                result_html(
+                    "OpenAI 프롬프트",
+                    "Microsoft Office Web Viewer 실행",
+                    &message,
+                    Some(prompt),
+                ),
+            ),
+            Err(err) => (
+                "500 Internal Server Error",
+                "text/html; charset=utf-8",
+                result_html("OpenAI 프롬프트", "실패", &err, Some(prompt)),
+            ),
+        },
         Ok(PromptAction::Deny) => (
             "200 OK",
             "text/html; charset=utf-8",
@@ -472,10 +521,12 @@ fn classify_prompt_with_openai(prompt: &str) -> Result<PromptAction, String> {
     let model = openai_model();
 
     let instructions = "\
-한국어 명령 분류기. 한 단어만 출력: OPEN_EXCEL, OPEN_CSV, OPEN_GOOGLE_SHEETS, CREATE_GOOGLE_SHEETS, DENY. \
+한국어 명령 분류기. 한 단어만 출력: OPEN_EXCEL, OPEN_CSV, OPEN_GOOGLE_SHEETS, CREATE_GOOGLE_SHEETS, OPEN_MICROSOFT_EXCEL_WEB, OPEN_MICROSOFT_OFFICE_VIEWER, DENY. \
 엑셀 실행/열기/켜줘는 OPEN_EXCEL. CSV/표 데이터/샘플 CSV는 OPEN_CSV. \
 구글 스프레드시트/구글시트/Google Sheets/웹 스프레드시트/웹엑셀을 열기/실행/켜기는 OPEN_GOOGLE_SHEETS. \
-구글 시트를 새로 만들기/생성/샘플 데이터 채워서 만들기는 CREATE_GOOGLE_SHEETS. 나머지는 DENY.";
+구글 시트를 새로 만들기/생성/샘플 데이터 채워서 만들기는 CREATE_GOOGLE_SHEETS. \
+마이크로소프트 웹용 엑셀/Excel for the web/Microsoft 365 Excel/MS 웹엑셀은 OPEN_MICROSOFT_EXCEL_WEB. \
+MS Office Web Viewer/Office Web Viewer/엑셀 웹 뷰어/웹용 엑셀 뷰어/뷰어로 보기 요청은 OPEN_MICROSOFT_OFFICE_VIEWER. 나머지는 DENY.";
     let input = format!("요청: {prompt}");
     let payload = format!(
         "{{\"model\":{},\"instructions\":{},\"input\":{},\"reasoning\":{{\"effort\":\"none\"}},\"max_output_tokens\":64,\"store\":false}}",
@@ -486,7 +537,11 @@ fn classify_prompt_with_openai(prompt: &str) -> Result<PromptAction, String> {
 
     let body = call_openai_responses_api(&api_key, &payload)?;
     let decision_area = openai_output_area(&body);
-    if decision_area.contains("CREATE_GOOGLE_SHEETS") {
+    if decision_area.contains("OPEN_MICROSOFT_OFFICE_VIEWER") {
+        Ok(PromptAction::OpenMicrosoftOfficeViewer)
+    } else if decision_area.contains("OPEN_MICROSOFT_EXCEL_WEB") {
+        Ok(PromptAction::OpenMicrosoftExcelWeb)
+    } else if decision_area.contains("CREATE_GOOGLE_SHEETS") {
         Ok(PromptAction::CreateGoogleSheets)
     } else if decision_area.contains("OPEN_GOOGLE_SHEETS") {
         Ok(PromptAction::OpenGoogleSheets)
@@ -607,8 +662,7 @@ fn create_csv_and_open() -> Result<String, String> {
 
 fn open_google_sheets() -> Result<String, String> {
     let url = google_sheets_url();
-    let command = format!("Start-Process {}", powershell_single_quote(&url));
-    spawn_powershell(&command)?;
+    open_browser_url(&url)?;
     Ok(format!(
         "Google Sheets 새 스프레드시트 실행 요청을 보냈습니다.\nURL: {url}\n기존 브라우저의 Google 로그인 세션을 사용합니다.\n"
     ))
@@ -620,6 +674,59 @@ fn google_sheets_url() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "https://docs.google.com/spreadsheets/create".to_string())
+}
+
+fn open_microsoft_excel_web() -> Result<String, String> {
+    let url = microsoft_excel_web_url();
+    open_browser_url(&url)?;
+    Ok(format!(
+        "Microsoft Excel for the web 실행 요청을 보냈습니다.\nURL: {url}\n브라우저의 기존 Microsoft 365 로그인 세션을 사용합니다.\n"
+    ))
+}
+
+fn open_microsoft_office_viewer(explicit_src: Option<&str>) -> Result<String, String> {
+    let src = office_viewer_source_url(explicit_src)?;
+    let url = microsoft_office_viewer_url(&src);
+    open_browser_url(&url)?;
+    Ok(format!(
+        "Microsoft Office Web Viewer 실행 요청을 보냈습니다.\nWorkbook: {src}\nViewer: {url}\n"
+    ))
+}
+
+fn open_browser_url(url: &str) -> Result<(), String> {
+    let command = format!("Start-Process {}", powershell_single_quote(url));
+    spawn_powershell(&command)
+}
+
+fn microsoft_excel_web_url() -> String {
+    env::var("MS_EXCEL_WEB_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://www.microsoft365.com/launch/excel?auth=1".to_string())
+}
+
+fn office_viewer_source_url(explicit_src: Option<&str>) -> Result<String, String> {
+    if let Some(value) = explicit_src
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(value.to_string());
+    }
+    env::var("MS_OFFICE_VIEWER_SRC_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "MS_OFFICE_VIEWER_SRC_URL 또는 src 파라미터가 필요합니다. Office Web Viewer는 Microsoft 서버가 접근 가능한 공개 .xlsx URL만 볼 수 있습니다.".to_string()
+        })
+}
+
+fn microsoft_office_viewer_url(src: &str) -> String {
+    format!(
+        "https://view.officeapps.live.com/op/view.aspx?src={}",
+        url_encode(src)
+    )
 }
 
 fn demo_csv_path() -> PathBuf {
@@ -732,6 +839,20 @@ fn url_decode(value: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+fn url_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 fn hex_value(byte: u8) -> Option<u8> {

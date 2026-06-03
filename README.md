@@ -7,8 +7,16 @@
 1. 로컬 웹앱이 로컬 Windows Excel을 실행할 수 있다.
 2. 리모트 Vultr 서버가 Tailscale을 통해 로컬 PC의 Excel 실행 agent를 호출할 수 있다.
 3. 같은 allowlist 구조로 Google Sheets 새 스프레드시트도 브라우저의 기존 Google 로그인 세션에서 열 수 있다.
+4. Vultr gateway가 공개 샘플 `.xlsx`를 제공하고, local agent가 로컬 PC 브라우저에서 Microsoft Excel for the web 또는 Microsoft Office Web Viewer를 열 수 있다.
 
 브라우저가 직접 로컬 프로그램을 실행하는 방식이 아닙니다. 브라우저는 HTTP 요청만 보내고, Rust 서버 또는 local agent가 allowlist된 실행 작업을 수행합니다. ActiveX는 사용하지 않습니다. Google Sheets 실행은 로컬 프로그램 의존이 아니라 기본 브라우저의 인증된 Google 세션으로 `https://docs.google.com/spreadsheets/create`를 여는 웹 스프레드시트 경로입니다.
+
+Microsoft 경로도 분리했습니다.
+
+- Microsoft Excel for the web: 기본 URL `https://www.microsoft365.com/launch/excel?auth=1`
+- Microsoft Office Web Viewer: `https://view.officeapps.live.com/op/view.aspx?src=<public-xlsx-url>`
+
+Office Web Viewer는 Microsoft 서버가 접근 가능한 공개 문서 URL만 볼 수 있습니다. 그래서 gateway는 `/sample.xlsx`를 공개로 제공하고, local agent는 그 URL을 Office Web Viewer에 넘겨 로컬 PC 브라우저에서 웹 뷰어를 띄웁니다.
 
 ## Architecture
 
@@ -56,6 +64,8 @@ Browser
 엑셀 실행해줘 -> OPEN_EXCEL
 샘플 CSV 만들어서 엑셀로 열어줘 -> OPEN_CSV
 구글 스프레드시트 열어줘 -> OPEN_GOOGLE_SHEETS
+MS 웹용 엑셀 열어줘 -> OPEN_MICROSOFT_EXCEL_WEB
+MS 엑셀 웹 뷰어로 봐줘 -> OPEN_MICROSOFT_OFFICE_VIEWER
 기타 요청 -> DENY
 ```
 
@@ -139,9 +149,12 @@ Local-only endpoints:
 - `GET /open-excel`
 - `GET /open-csv`
 - `GET /open-google-sheets`
+- `GET /open-ms-excel-web`
+- `GET /open-ms-office-viewer`
 - `POST /prompt`
 
 Google Sheets URL은 기본값으로 `https://docs.google.com/spreadsheets/create`를 사용합니다. 특정 문서나 Google Workspace 경로를 열고 싶으면 실행 환경에서 `GOOGLE_SHEETS_URL`을 지정하십시오.
+Microsoft Excel for the web URL은 `MS_EXCEL_WEB_URL`로 바꿀 수 있습니다. Office Web Viewer는 `MS_OFFICE_VIEWER_SRC_URL` 또는 `src` query parameter가 필요합니다.
 
 ## Vultr + Tailscale Build
 
@@ -207,6 +220,9 @@ Gateway endpoints:
 - `POST /prompt`
 - `POST /prompt-computer`
 - `POST /open-google-sheets`
+- `POST /open-ms-excel-web`
+- `POST /open-ms-office-viewer`
+- `GET /sample.xlsx`
 
 ## Systemd User Services
 
@@ -263,6 +279,45 @@ Google Sheets 새 스프레드시트 실행 요청을 보냈습니다.
 URL: https://docs.google.com/spreadsheets/create
 기존 브라우저의 Google 로그인 세션을 사용합니다.
 ```
+
+Microsoft Excel for the web mode:
+
+```bash
+curl -X POST http://100.y.y.y:8878/open-ms-excel-web
+```
+
+Microsoft Office Web Viewer mode:
+
+```bash
+curl -X POST http://100.y.y.y:8878/open-ms-office-viewer
+```
+
+이때 gateway는 기본적으로 자기 공개 URL의 `/sample.xlsx`를 viewer source로 넘깁니다. 공인 URL이 자동으로 잡히지 않는 환경에서는 gateway env에 다음 값을 지정하십시오.
+
+```bash
+EXCEL_GATEWAY_PATH_PREFIX=/web-excel
+EXCEL_GATEWAY_PUBLIC_URL=https://ntopng.nmsglobal.kr/web-excel
+```
+
+그리고 local agent env에는 같은 샘플 URL을 지정할 수 있습니다.
+
+```bash
+MS_OFFICE_VIEWER_SRC_URL=https://ntopng.nmsglobal.kr/web-excel/sample.xlsx
+```
+
+Vultr에서 이미 Caddy가 80/443을 담당하는 경우에는 새 공개 포트를 열지 말고 Caddy에 다음 path proxy만 추가하면 됩니다.
+
+```caddy
+handle /web-excel* {
+    reverse_proxy http://127.0.0.1:8890
+}
+```
+
+## Microsoft References
+
+- Excel for the web supports browser-based workbook work and common workbook formats: <https://support.microsoft.com/en-us/office/differences-between-using-a-workbook-in-the-browser-and-in-excel-f0dc28ed-b85d-4e1d-be6d-5878005db3b6>
+- Microsoft documents creating workbooks in Excel for the web from Microsoft 365 Home or OneDrive: <https://support.microsoft.com/en-us/office/quick-tips-get-work-done-with-excel-for-the-web-49a8a468-227f-417b-92c4-fd247a93a62d>
+- Microsoft Q&A references the Office Web Viewer URL shape `view.officeapps.live.com/op/view.aspx?src=...`: <https://learn.microsoft.com/en-us/answers/questions/5130657/view-officeapps-live-com-access-error>
 
 Computer Use mode:
 
